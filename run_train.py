@@ -4,6 +4,7 @@ Usage:
     python run_train.py beignet --phase paper    # Phase 1: paper-faithful reproduction
     python run_train.py affi --phase compete     # Phase 2: OOD competition config
     python run_train.py beignet                  # Default: Phase 2 (compete)
+    python run_train.py beignet --seed 123       # Multi-seed training
 """
 import sys
 import argparse
@@ -22,6 +23,9 @@ def main():
                              "compete = Phase 2 (OOD extensions)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (default: from config). "
+                             "Use different seeds for multi-seed ensemble.")
     args = parser.parse_args()
 
     if args.phase == "paper":
@@ -31,6 +35,11 @@ def main():
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
+
+    if args.seed is not None:
+        cfg.seed = args.seed
+        # Use seed-specific checkpoint directory for multi-seed ensemble
+        cfg.checkpoint_dir = f"checkpoints/seed_{args.seed}"
 
     # Thermal-safe batch sizes (RTX 4090 Laptop overheats under sustained load)
     cfg.cooldown_ms = 50

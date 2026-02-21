@@ -20,23 +20,58 @@ def compute_norm_stats(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mean, std
 
 
+def compute_sample_norm_stats(context: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-sample normalization stats from context window.
+
+    Matches the TTA normalization used in submission/model.py predict().
+
+    Args:
+        context: (T_ctx, C, F) context window for a single sample
+    Returns:
+        mean, std: each (1, C*F) arrays
+    """
+    t, c, f = context.shape
+    flat = context.reshape(t, c * f)
+    mean = flat.mean(axis=0, keepdims=True)
+    std = flat.std(axis=0, keepdims=True)
+    return mean, std
+
+
 def normalize(data: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """Normalize data to [-1, 1] using [mean-4*std, mean+4*std] range.
 
     Args:
-        data: (N, T, C, F)
+        data: (N, T, C, F) or (T, C, F)
         mean, std: (1, C*F)
     Returns:
-        Normalized data (N, T, C, F)
+        Normalized data, same shape as input
     """
-    n, t, c, f = data.shape
-    flat = data.reshape(n * t, c * f)
+    orig_shape = data.shape
+    c_f = mean.shape[1]
+    flat = data.reshape(-1, c_f)
     lo = mean - 4 * std
     hi = mean + 4 * std
     denom = hi - lo
     denom = np.where(denom == 0, 1.0, denom)
     norm = 2 * (flat - lo) / denom - 1
-    return norm.reshape(n, t, c, f)
+    return norm.reshape(orig_shape)
+
+
+def normalize_sample(data: np.ndarray, context_len: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalize a single sample using its context window stats (TTA-style).
+
+    Args:
+        data: (T, C, F) raw data for one sample
+        context_len: number of context timesteps
+    Returns:
+        data_norm: (T, C, F) normalized data
+        mean: (1, C*F) normalization mean
+        std: (1, C*F) normalization std
+    """
+    context = data[:context_len]  # (T_ctx, C, F)
+    mean, std = compute_sample_norm_stats(context)
+    data_norm = normalize(data, mean, std)
+    return data_norm, mean, std
 
 
 def denormalize(data: np.ndarray, mean: np.ndarray, std: np.ndarray,
@@ -73,26 +108,24 @@ def denormalize_torch(data: torch.Tensor, mean: torch.Tensor, std: torch.Tensor,
 
 
 class NeuralForecastDataset(Dataset):
-    def __init__(self, data_norm: np.ndarray, targets_raw: np.ndarray,
-                 context_len: int = 10, session_ids: np.ndarray | None = None,
+    def __init__(self, data_raw: np.ndarray, context_len: int = 10,
+                 session_ids: np.ndarray | None = None,
                  augment: bool = False,
                  jitter_std: float = 0.02,
                  scale_std: float = 0.1,
                  channel_drop_p: float = 0.1):
         """
         Args:
-            data_norm: (N, T, C, F) already normalized data
-            targets_raw: (N, T, C) raw LMP targets
+            data_raw: (N, T, C, F) raw (unnormalized) data
             context_len: number of context timesteps
-            session_ids: (N,) integer session index per trial (for cross-session mixup)
+            session_ids: (N,) integer session index per trial
             augment: whether to apply on-the-fly augmentation
             jitter_std: Gaussian noise std for jittering
             scale_std: per-channel random scale std
             channel_drop_p: probability of zeroing each channel
         """
         self.context_len = context_len
-        self.data_norm = data_norm.astype(np.float32)
-        self.targets_raw = targets_raw.astype(np.float32)
+        self.data_raw = data_raw.astype(np.float32)
         self.session_ids = session_ids
         self.augment = augment
         self.jitter_std = jitter_std
@@ -100,26 +133,33 @@ class NeuralForecastDataset(Dataset):
         self.channel_drop_p = channel_drop_p
 
     def __len__(self):
-        return len(self.data_norm)
+        return len(self.data_raw)
 
     def __getitem__(self, idx):
-        x = self.data_norm[idx].copy()  # (T, C, F)
+        x_raw = self.data_raw[idx].copy()  # (T, C, F)
+
+        # Per-sample TTA normalization: use context window stats
+        x_norm, mean, std = normalize_sample(x_raw, self.context_len)
 
         if self.augment:
-            x = self._apply_augmentation(x)
+            x_norm = self._apply_augmentation(x_norm)
 
         # Mask future: replace steps after context with copy of last context step
-        x[self.context_len:] = x[self.context_len - 1]
+        x_norm[self.context_len:] = x_norm[self.context_len - 1]
 
-        x_tensor = torch.from_numpy(x)
-        target_norm = torch.from_numpy(self.data_norm[idx, :, :, 0])  # (T, C)
-        target_raw = torch.from_numpy(self.targets_raw[idx])  # (T, C)
+        x_tensor = torch.from_numpy(x_norm)
+        target_norm = torch.from_numpy(x_norm[:, :, 0].copy())  # (T, C) normalized LMP
+        target_raw = torch.from_numpy(x_raw[:, :, 0])  # (T, C) raw LMP
+
+        # Pack per-sample norm stats for denormalization during training
+        mean_t = torch.from_numpy(mean)  # (1, C*F)
+        std_t = torch.from_numpy(std)    # (1, C*F)
 
         if self.session_ids is not None:
             session_id = torch.tensor(self.session_ids[idx], dtype=torch.long)
-            return x_tensor, target_norm, target_raw, session_id
+            return x_tensor, target_norm, target_raw, session_id, mean_t, std_t
 
-        return x_tensor, target_norm, target_raw
+        return x_tensor, target_norm, target_raw, mean_t, std_t
 
     def _apply_augmentation(self, x: np.ndarray) -> np.ndarray:
         """Apply jittering, scaling, and channel dropout to normalized input.
@@ -166,64 +206,57 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
                      jitter_std: float = 0.02,
                      scale_std: float = 0.1,
                      channel_drop_p: float = 0.1):
-    """Load and prepare train/val datasets with per-session normalization.
+    """Load and prepare train/val datasets with per-sample TTA normalization.
 
-    Each session is normalized independently using its own statistics.
-    This ensures all sessions map to a consistent [-1, 1] range regardless
-    of their raw signal scale.
+    Each sample is normalized on-the-fly using its own context window stats,
+    matching the inference-time TTA normalization in submission/model.py.
+    Cross-date sessions contribute to both train and validation sets.
 
     Returns:
         train_dataset, val_dataset, per_session_stats
     """
     all_data = load_all_train_data(dataset_dir, train_files)
 
-    # Per-session normalization: normalize each session with its own stats
-    all_norm = []
-    all_raw_lmp = []
+    # Compute per-session stats (still needed for backward compat / reference)
     per_session_stats = []
-
     for session_data in all_data:
         mean, std = compute_norm_stats(session_data)
         per_session_stats.append((mean, std))
-        norm = normalize(session_data, mean, std)
-        all_norm.append(norm)
-        all_raw_lmp.append(session_data[:, :, :, 0])
 
-    # Split: val from the primary (same-day) session only
     rng = np.random.RandomState(seed)
-    primary_norm = all_norm[0]
-    primary_raw = all_raw_lmp[0]
-    n = len(primary_norm)
-    indices = rng.permutation(n)
-    n_val = max(1, int(n * val_split))
-    val_idx = indices[:n_val]
-    train_idx = indices[n_val:]
 
-    # Training: primary train split + all cross-day sessions
-    train_norm_parts = [primary_norm[train_idx]]
-    train_raw_parts = [primary_raw[train_idx]]
-    train_session_parts = [np.zeros(len(train_idx), dtype=np.int64)]  # session 0
+    # Split each session into train/val
+    train_raw_parts = []
+    val_raw_parts = []
+    train_session_parts = []
+    val_session_parts = []
 
-    for i in range(1, len(all_norm)):
-        train_norm_parts.append(all_norm[i])
-        train_raw_parts.append(all_raw_lmp[i])
-        train_session_parts.append(np.full(len(all_norm[i]), i, dtype=np.int64))
+    for i, session_data in enumerate(all_data):
+        n = len(session_data)
+        indices = rng.permutation(n)
+        n_val = max(1, int(n * val_split))
+        val_idx = indices[:n_val]
+        train_idx = indices[n_val:]
 
-    train_norm = np.concatenate(train_norm_parts, axis=0)
+        train_raw_parts.append(session_data[train_idx])
+        val_raw_parts.append(session_data[val_idx])
+        train_session_parts.append(np.full(len(train_idx), i, dtype=np.int64))
+        val_session_parts.append(np.full(len(val_idx), i, dtype=np.int64))
+
     train_raw = np.concatenate(train_raw_parts, axis=0)
+    val_raw = np.concatenate(val_raw_parts, axis=0)
     train_sessions = np.concatenate(train_session_parts, axis=0)
-    val_norm = primary_norm[val_idx]
-    val_raw = primary_raw[val_idx]
+    val_sessions = np.concatenate(val_session_parts, axis=0)
 
     train_ds = NeuralForecastDataset(
-        train_norm, train_raw, context_len,
+        train_raw, context_len,
         session_ids=train_sessions,
         augment=augment,
         jitter_std=jitter_std,
         scale_std=scale_std,
         channel_drop_p=channel_drop_p,
     )
-    val_ds = NeuralForecastDataset(val_norm, val_raw, context_len)
+    val_ds = NeuralForecastDataset(val_raw, context_len,
+                                    session_ids=val_sessions)
 
-    # Return primary session stats for backward compat (val evaluation)
     return train_ds, val_ds, per_session_stats

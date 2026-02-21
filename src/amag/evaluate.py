@@ -84,6 +84,7 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
     """Copy checkpoint files to submission directory for Model class."""
     import shutil
 
+    # Copy default checkpoints
     for pattern in [f"amag_{monkey_name}_snap*.pth",
                     f"amag_{monkey_name}_best.pth",
                     f"amag_{monkey_name}_ema_best.pth"]:
@@ -91,6 +92,18 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
             dst = sub_dir / src.name
             if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
                 shutil.copy2(str(src), str(dst))
+
+    # Copy multi-seed checkpoints
+    for seed_dir in sorted(ckpt_dir.glob("seed_*")):
+        if seed_dir.is_dir():
+            dst_seed_dir = sub_dir / seed_dir.name
+            dst_seed_dir.mkdir(exist_ok=True)
+            for pattern in [f"amag_{monkey_name}_snap*.pth",
+                            f"amag_{monkey_name}_best.pth"]:
+                for src in seed_dir.glob(pattern):
+                    dst = dst_seed_dir / src.name
+                    if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                        shutil.copy2(str(src), str(dst))
 
 
 if __name__ == "__main__":

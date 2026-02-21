@@ -51,7 +51,9 @@ class TrainConfig:
     num_features: int = 9
 
     # Model
-    hidden_dim: int = 64
+    hidden_dim: int = 128
+    num_heads: int = 4
+    num_layers: int = 2
     dropout: float = 0.0
     use_adaptor: bool = False
 
@@ -104,7 +106,10 @@ class TrainConfig:
 def phase1_config() -> TrainConfig:
     """Paper-faithful AMAG config (Li et al., NeurIPS 2023)."""
     return TrainConfig(
-        # Model: enable adaptor per paper
+        # Model: paper-faithful (64d, 1 head, 1 layer, adaptor)
+        hidden_dim=64,
+        num_heads=1,
+        num_layers=1,
         use_adaptor=True,
         # Optimizer: Adam (Kingma & Ba, ICLR 2015) — paper specifies Adam, not AdamW
         optimizer_type="adam",
@@ -137,18 +142,18 @@ def phase2_config() -> TrainConfig:
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
         weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 50 epochs)
+        # Scheduler: CosineAnnealingWarmRestarts (6 cycles of 50 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=150,
+        epochs=300,
         val_every=5,
-        patience=20,
+        patience=30,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=10,
         # Snapshot ensemble (Huang et al., ICLR 2017)
-        num_snapshots=3,
+        num_snapshots=6,
         snapshot_cycle_len=50,
         # Augmentation
         aug_jitter_std=0.02,

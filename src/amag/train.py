@@ -77,12 +77,26 @@ def mixup_batch(x1, tn1, tr1, x2, tn2, tr2, alpha=0.3):
 
 
 def _unpack_batch(batch):
-    """Unpack batch tuple, handling both 3-tuple and 4-tuple (with session_id)."""
-    if len(batch) == 4:
+    """Unpack batch tuple, handling variable-length tuples.
+
+    Returns: x, target_norm, target_raw, session_ids, mean, std
+    Session_ids, mean, std may be None.
+    """
+    if len(batch) == 6:
+        # With session_ids: x, target_norm, target_raw, session_id, mean, std
+        x, target_norm, target_raw, session_ids, mean, std = batch
+        return x, target_norm, target_raw, session_ids, mean, std
+    elif len(batch) == 5:
+        # Without session_ids: x, target_norm, target_raw, mean, std
+        x, target_norm, target_raw, mean, std = batch
+        return x, target_norm, target_raw, None, mean, std
+    elif len(batch) == 4:
+        # Legacy format with session_ids but no per-sample stats
         x, target_norm, target_raw, session_ids = batch
-        return x, target_norm, target_raw, session_ids
-    x, target_norm, target_raw = batch
-    return x, target_norm, target_raw, None
+        return x, target_norm, target_raw, session_ids, None, None
+    else:
+        x, target_norm, target_raw = batch
+        return x, target_norm, target_raw, None, None, None
 
 
 def train_monkey(monkey_name: str, cfg: TrainConfig):
@@ -102,7 +116,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     monkey_cfg = MONKEY_CONFIGS[monkey_name]
     C = monkey_cfg.num_channels
 
-    # Prepare data (per-session normalization + augmentation)
+    # Prepare data (per-sample TTA normalization + augmentation)
     train_ds, val_ds, per_session_stats = prepare_datasets(
         dataset_dir=cfg.dataset_dir,
         train_files=monkey_cfg.train_files,
@@ -116,11 +130,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     )
     print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
 
-    # Val uses primary session stats for denormalization
-    val_mean, val_std = per_session_stats[0]
-    val_mean_t = torch.from_numpy(val_mean).float().to(device)
-    val_std_t = torch.from_numpy(val_std).float().to(device)
-
     # Gradient accumulation: effective_batch = batch_size * accumulate_steps
     accumulate_steps = cfg.accumulate_steps
 
@@ -129,8 +138,21 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=0, pin_memory=True)
 
-    # Compute correlation matrix from normalized training data
-    corr = compute_correlation_matrix(train_ds.data_norm)
+    # Compute correlation matrix from raw training data (per-sample norm applied inside dataset)
+    # We need to normalize to compute correlation — use session-level stats for this
+    from .data import normalize as np_normalize
+    all_norm_for_corr = []
+    for i, (mean, std) in enumerate(per_session_stats):
+        # Get the raw data for this session from the dataset
+        pass
+    # Simpler: compute correlation from the first batch of normalized data
+    # Or use the per-session stats approach on raw data
+    from .data import load_all_train_data
+    all_raw = load_all_train_data(cfg.dataset_dir, monkey_cfg.train_files)
+    # Normalize primary session for correlation computation
+    primary_mean, primary_std = per_session_stats[0]
+    primary_norm = np_normalize(all_raw[0], primary_mean, primary_std)
+    corr = compute_correlation_matrix(primary_norm)
     corr_tensor = torch.from_numpy(corr).to(device)
 
     # Adaptor chunk size: smaller for large channel counts to save memory
@@ -141,12 +163,15 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         num_channels=C,
         num_features=cfg.num_features,
         hidden_dim=cfg.hidden_dim,
+        d_ff=cfg.hidden_dim * 4,
         total_len=cfg.total_len,
         corr_matrix=corr_tensor,
         dropout=cfg.dropout,
         use_adaptor=cfg.use_adaptor,
         adaptor_chunk_size=adaptor_chunk,
         use_revin=cfg.use_revin,
+        num_heads=cfg.num_heads,
+        num_layers=cfg.num_layers,
     ).to(device)
 
     # Keep reference to raw module for CORAL path (needs sub-module access)
@@ -167,26 +192,19 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
     # Optimizer selection
     if cfg.optimizer_type == "adam":
-        # Adam (Kingma & Ba, ICLR 2015) — paper specification
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
                                      weight_decay=cfg.weight_decay)
     else:
-        # AdamW with decoupled weight decay (Loshchilov & Hutter, ICLR 2019)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                        weight_decay=cfg.weight_decay)
 
     # Scheduler selection
     if cfg.scheduler_type == "step":
-        # StepLR: x0.95 every 50 epochs — paper specification
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=cfg.lr_decay_every, gamma=cfg.lr_decay)
     else:
-        # CosineAnnealingWarmRestarts for snapshot ensemble (Huang et al. ICLR 2017)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=cfg.snapshot_cycle_len, T_mult=1)
-
-    # Note: GradScaler is unnecessary with bfloat16 (same exponent range as fp32,
-    # no overflow risk). Removing it avoids per-batch scale/unscale/update overhead.
 
     # EMA model
     ema = EMAModel(model, decay=cfg.ema_decay) if cfg.use_ema else None
@@ -233,7 +251,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         accum_count = 0
 
         for batch in train_loader:
-            x, target_norm, target_raw, session_ids = _unpack_batch(batch)
+            x, target_norm, target_raw, session_ids, batch_mean, batch_std = _unpack_batch(batch)
             x = x.to(device)
             target_norm = target_norm.to(device)
 
@@ -244,7 +262,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 except StopIteration:
                     mixup_iter = iter(mixup_loader)
                     batch2 = next(mixup_iter)
-                x2, tn2, tr2, _ = _unpack_batch(batch2)
+                x2, tn2, tr2, _, _, _ = _unpack_batch(batch2)
                 x2 = x2.to(device)
                 tn2 = tn2.to(device)
                 x, target_norm, _ = mixup_batch(
@@ -260,7 +278,14 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     z = raw_model.si(h)
                     pred = raw_model.tr(z)
                     if raw_model.use_revin:
-                        pred = raw_model.revin.denormalize(pred)
+                        # RevIN is on C*F dims; expand pred to match, denorm, extract LMP
+                        B_p, T_p, C_p = pred.shape
+                        F_p = raw_model.num_features
+                        pred_exp = torch.zeros(B_p, T_p, C_p * F_p,
+                                               device=pred.device, dtype=pred.dtype)
+                        pred_exp[:, :, ::F_p] = pred
+                        pred_denorm = raw_model.revin.denormalize(pred_exp)
+                        pred = pred_denorm[:, :, ::F_p]
                     coral_l = compute_coral_from_hidden(h, session_ids.to(device))
                 else:
                     pred = model(x)
@@ -330,14 +355,14 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         if epoch % cfg.val_every == 0 or epoch == 1:
             model.eval()
             val_mse_raw = evaluate_raw_mse(
-                model, val_loader, val_mean_t, val_std_t, cfg, device,
+                model, val_loader, cfg, device,
                 use_amp=use_amp, amp_dtype=amp_dtype)
 
             # Also evaluate EMA model
             ema_mse_str = ""
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 ema_val_mse = evaluate_raw_mse(
-                    ema.shadow, val_loader, val_mean_t, val_std_t, cfg, device,
+                    ema.shadow, val_loader, cfg, device,
                     use_amp=use_amp, amp_dtype=amp_dtype)
                 ema_mse_str = f" | EMA MSE: {ema_val_mse:.6f}"
 
@@ -391,26 +416,42 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     return model
 
 
-def evaluate_raw_mse(model, loader, mean_t, std_t, cfg, device, use_amp=False,
+def evaluate_raw_mse(model, loader, cfg, device, use_amp=False,
                      amp_dtype=torch.bfloat16):
-    """Evaluate MSE in raw (denormalized) space, matching Codabench scoring."""
+    """Evaluate MSE in raw (denormalized) space, matching Codabench scoring.
+
+    Uses per-sample TTA normalization stats for denormalization.
+    """
     model.eval()
     total_se = 0.0
     total_count = 0
 
     with torch.no_grad():
         for batch in loader:
-            x, target_norm, target_raw = _unpack_batch(batch)[:3]
+            x, target_norm, target_raw, session_ids, batch_mean, batch_std = _unpack_batch(batch)
             x = x.to(device)
             target_raw = target_raw.to(device)
 
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                 pred_norm = model(x)
 
-            # Denormalize in fp32
+            # Denormalize per-sample using each sample's own TTA stats
             pred_norm = pred_norm.float()
-            pred_raw = denormalize_torch(
-                pred_norm, mean_t, std_t, num_features=cfg.num_features)
+            batch_mean = batch_mean.to(device)  # (B, 1, C*F)
+            batch_std = batch_std.to(device)    # (B, 1, C*F)
+
+            # Extract LMP stats (feature 0, stride num_features)
+            num_f = cfg.num_features
+            mean_lmp = batch_mean[:, 0, ::num_f]  # (B, C)
+            std_lmp = batch_std[:, 0, ::num_f]    # (B, C)
+
+            lo = mean_lmp - 4 * std_lmp  # (B, C)
+            hi = mean_lmp + 4 * std_lmp  # (B, C)
+            denom = hi - lo
+            denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+
+            # pred_norm: (B, T, C), lo/hi: (B, C) -> (B, 1, C)
+            pred_raw = (pred_norm + 1) * denom.unsqueeze(1) / 2 + lo.unsqueeze(1)
 
             forecast_pred = pred_raw[:, cfg.context_len:]
             forecast_target = target_raw[:, cfg.context_len:]

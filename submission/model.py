@@ -1,11 +1,13 @@
 """Codabench-compatible submission model.
 
 Self-contained AMAG model definition + inference with TTA normalization.
-Phase 2: Snapshot ensemble (averages predictions from 3 snapshots).
-Optional RevIN (Kim et al., ICLR 2022) for distribution shift handling.
+Phase 2: Snapshot ensemble (averages predictions from up to 6 snapshots x multiple seeds).
+RevIN (Kim et al., ICLR 2022) on all 9 features for distribution shift handling.
+Prediction smoothing post-processing.
 
 Expected files alongside this script:
-  - amag_{monkey}_snap1.pth, amag_{monkey}_snap2.pth, amag_{monkey}_snap3.pth
+  - amag_{monkey}_snap{1..6}.pth (default seed)
+  - seed_{seed}/amag_{monkey}_snap{1..6}.pth (multi-seed)
   - Falls back to amag_{monkey}_best.pth if snapshots not found
 """
 
@@ -59,43 +61,61 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 
-# ---- Transformer Block ----
+# ---- Transformer Block (multi-head) ----
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, d_ff=256):
+    def __init__(self, d_model, d_ff=256, num_heads=1):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
-        self.scale = math.sqrt(d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = math.sqrt(self.head_dim)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.attn_drop = nn.Dropout(0.0)
         self.ffn_drop = nn.Dropout(0.0)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.ReLU(), nn.Dropout(0.0),
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(0.0),
             nn.Linear(d_ff, d_model))
 
     def forward(self, x):
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        B, T, D = x.shape
+        H = self.num_heads
+        HD = self.head_dim
+
+        q = self.q_proj(x).view(B, T, H, HD).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, H, HD).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, H, HD).transpose(1, 2)
+
         attn = torch.softmax(q @ k.transpose(-2, -1) / self.scale, dim=-1)
         attn = self.attn_drop(attn)
-        x = self.norm1(x + attn @ v)
+        attn_out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        attn_out = self.out_proj(attn_out)
+
+        x = self.norm1(x + attn_out)
         x = self.norm2(x + self.ffn_drop(self.ffn(x)))
         return x
 
 
 # ---- TE ----
 class TemporalEncoder(nn.Module):
-    def __init__(self, input_dim=9, hidden_dim=64, d_ff=256):
+    def __init__(self, input_dim=9, hidden_dim=64, d_ff=256, num_heads=1, num_layers=1):
         super().__init__()
         self.embed = nn.Linear(input_dim, hidden_dim)
         self.pe = PositionalEncoding(hidden_dim)
-        self.transformer = TransformerBlock(hidden_dim, d_ff)
+        self.layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, d_ff, num_heads=num_heads)
+            for _ in range(num_layers)
+        ])
 
     def forward(self, x):
         B, T, C, F = x.shape
         x = x.permute(0, 2, 1, 3).reshape(B * C, T, F)
-        h = self.transformer(self.pe(self.embed(x)))
+        h = self.pe(self.embed(x))
+        for layer in self.layers:
+            h = layer(h)
         return h.reshape(B, C, T, -1).permute(0, 2, 1, 3)
 
 
@@ -176,16 +196,21 @@ class SpatialInteraction(nn.Module):
 
 # ---- TR ----
 class TemporalReadout(nn.Module):
-    def __init__(self, hidden_dim=64, d_ff=256):
+    def __init__(self, hidden_dim=64, d_ff=256, num_heads=1, num_layers=1):
         super().__init__()
         self.pe = PositionalEncoding(hidden_dim)
-        self.transformer = TransformerBlock(hidden_dim, d_ff)
+        self.layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, d_ff, num_heads=num_heads)
+            for _ in range(num_layers)
+        ])
         self.output_fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, z):
         B, T, C, D = z.shape
         z = z.permute(0, 2, 1, 3).reshape(B * C, T, D)
-        r = self.transformer(self.pe(z))
+        r = self.pe(z)
+        for layer in self.layers:
+            r = layer(r)
         pred = self.output_fc(r).squeeze(-1)
         return pred.reshape(B, C, T).permute(0, 2, 1)
 
@@ -194,29 +219,36 @@ class TemporalReadout(nn.Module):
 class AMAG(nn.Module):
     def __init__(self, num_channels, num_features=9, hidden_dim=64, d_ff=256,
                  total_len=20, use_adaptor=False, adaptor_chunk_size=8,
-                 use_revin=False):
+                 use_revin=False, num_heads=1, num_layers=1):
         super().__init__()
+        self.num_features = num_features
         self.use_revin = use_revin
         if use_revin:
-            self.revin = RevIN(num_channels)
-        self.te = TemporalEncoder(num_features, hidden_dim, d_ff)
+            self.revin = RevIN(num_channels * num_features)
+        self.te = TemporalEncoder(num_features, hidden_dim, d_ff,
+                                   num_heads=num_heads, num_layers=num_layers)
         self.si = SpatialInteraction(num_channels, hidden_dim, total_len,
                                      use_adaptor, adaptor_chunk_size)
-        self.tr = TemporalReadout(hidden_dim, d_ff)
+        self.tr = TemporalReadout(hidden_dim, d_ff,
+                                   num_heads=num_heads, num_layers=num_layers)
 
     def forward(self, x):
+        B, T, C, F = x.shape
+
         if self.use_revin:
-            lmp = x[:, :, :, 0]
-            lmp_norm = self.revin.normalize(lmp)
-            x = x.clone()
-            x[:, :, :, 0] = lmp_norm
+            x_flat = x.reshape(B, T, C * F)
+            x_flat = self.revin.normalize(x_flat)
+            x = x_flat.reshape(B, T, C, F)
 
         h = self.te(x)
         z = self.si(h)
         pred = self.tr(z)
 
         if self.use_revin:
-            pred = self.revin.denormalize(pred)
+            pred_expanded = torch.zeros(B, T, C * F, device=pred.device, dtype=pred.dtype)
+            pred_expanded[:, :, ::F] = pred
+            pred_denorm = self.revin.denormalize(pred_expanded)
+            pred = pred_denorm[:, :, ::F]
 
         return pred
 
@@ -243,6 +275,23 @@ def denormalize_lmp(data, mean, std, num_features=9):
     return (data + 1) * denom / 2 + lo
 
 
+def smooth_predictions(pred, alpha=0.3):
+    """Apply exponential moving average smoothing to predictions.
+
+    Args:
+        pred: (N, T, C) predictions
+        alpha: smoothing factor (0 = no smoothing, 1 = replace with previous)
+    Returns:
+        Smoothed (N, T, C) predictions
+    """
+    if alpha <= 0:
+        return pred
+    smoothed = pred.copy()
+    for t in range(1, pred.shape[1]):
+        smoothed[:, t] = (1 - alpha) * pred[:, t] + alpha * smoothed[:, t - 1]
+    return smoothed
+
+
 # ---- Submission Model ----
 class Model:
     def __init__(self, monkey_name="beignet"):
@@ -257,61 +306,131 @@ class Model:
         self.models = []
         self.use_revin = False  # Detected from checkpoint
 
-    def _make_model(self, use_revin=False):
+    def _detect_arch(self, state_dict):
+        """Detect architecture parameters from checkpoint keys."""
+        use_revin = any(k.startswith("revin.") for k in state_dict.keys())
+
+        # Detect hidden_dim from embed layer
+        hidden_dim = 64
+        if "te.embed.weight" in state_dict:
+            hidden_dim = state_dict["te.embed.weight"].shape[0]
+
+        # Detect num_heads from head_dim: look for out_proj (only in multi-head)
+        num_heads = 1
+        if "te.layers.0.out_proj.weight" in state_dict:
+            # Multi-head: has out_proj
+            # Detect num_heads from q_proj vs head pattern
+            q_weight = state_dict["te.layers.0.q_proj.weight"]
+            d_model = q_weight.shape[0]
+            # We can't directly detect num_heads from weights alone,
+            # but we know d_model. Use hidden_dim / 32 as head_dim=32 heuristic.
+            if d_model >= 128:
+                num_heads = 4
+            else:
+                num_heads = 1
+        elif "te.transformer.out_proj.weight" in state_dict:
+            # Old multi-head format (single transformer block)
+            q_weight = state_dict["te.transformer.q_proj.weight"]
+            d_model = q_weight.shape[0]
+            if d_model >= 128:
+                num_heads = 4
+            else:
+                num_heads = 1
+
+        # Detect num_layers from key pattern
+        num_layers = 1
+        for k in state_dict.keys():
+            if k.startswith("te.layers."):
+                layer_idx = int(k.split(".")[2])
+                num_layers = max(num_layers, layer_idx + 1)
+
+        # Detect d_ff from FFN
+        d_ff = 256
+        for k in ("te.layers.0.ffn.0.weight", "te.transformer.ffn.0.weight"):
+            if k in state_dict:
+                d_ff = state_dict[k].shape[0]
+                break
+
+        return use_revin, hidden_dim, num_heads, num_layers, d_ff
+
+    def _make_model(self, use_revin=False, hidden_dim=64, num_heads=1,
+                    num_layers=1, d_ff=256):
         """Create a fresh AMAG model instance matching trained config."""
         chunk = 4 if self.num_channels > 200 else 8
         return AMAG(
             num_channels=self.num_channels,
             num_features=9,
-            hidden_dim=64,
-            d_ff=256,
+            hidden_dim=hidden_dim,
+            d_ff=d_ff,
             total_len=20,
             use_adaptor=False,
             adaptor_chunk_size=chunk,
             use_revin=use_revin,
+            num_heads=num_heads,
+            num_layers=num_layers,
         )
-
-    def _detect_revin(self, state_dict):
-        """Check if checkpoint was trained with RevIN."""
-        return any(k.startswith("revin.") for k in state_dict.keys())
 
     def load(self):
         base = os.path.dirname(__file__)
 
-        # Try loading 3 snapshot checkpoints for ensemble
-        snapshot_paths = [
-            os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
-            for i in range(1, 4)
-        ]
+        # Collect checkpoint paths from multiple seeds
+        all_ckpt_paths = []
 
-        snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
+        # Check for seed-specific directories
+        seed_dirs = []
+        for entry in os.listdir(base):
+            full = os.path.join(base, entry)
+            if os.path.isdir(full) and entry.startswith("seed_"):
+                seed_dirs.append(full)
 
-        if len(snapshots_found) >= 2:
-            # Detect RevIN from first snapshot
-            first_sd = torch.load(snapshots_found[0], map_location=device, weights_only=True)
-            self.use_revin = self._detect_revin(first_sd)
+        if seed_dirs:
+            # Multi-seed: load snapshots from each seed directory
+            for seed_dir in sorted(seed_dirs):
+                for i in range(1, 7):  # up to 6 snapshots
+                    p = os.path.join(seed_dir, f"amag_{self.monkey_name}_snap{i}.pth")
+                    if os.path.exists(p):
+                        all_ckpt_paths.append(p)
+                # Also check for best
+                best = os.path.join(seed_dir, f"amag_{self.monkey_name}_best.pth")
+                if os.path.exists(best) and not any(
+                    os.path.join(seed_dir, f"amag_{self.monkey_name}_snap") in p
+                    for p in all_ckpt_paths if seed_dir in p
+                ):
+                    all_ckpt_paths.append(best)
 
-            for path in snapshots_found:
-                m = self._make_model(use_revin=self.use_revin)
-                state_dict = torch.load(path, map_location=device, weights_only=True)
-                m.load_state_dict(state_dict)
-                m.to(device)
-                m.eval()
-                self.models.append(m)
-            print(f"Loaded {len(self.models)} snapshot models for ensemble "
-                  f"(revin={self.use_revin})")
-        else:
-            # Fallback: single best checkpoint
-            weight_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
-            state_dict = torch.load(weight_path, map_location=device, weights_only=True)
-            self.use_revin = self._detect_revin(state_dict)
+        # Also check base directory for snapshots (default seed)
+        for i in range(1, 7):
+            p = os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
+            if os.path.exists(p):
+                all_ckpt_paths.append(p)
 
-            m = self._make_model(use_revin=self.use_revin)
+        # Fallback to best checkpoint
+        if not all_ckpt_paths:
+            best = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
+            if os.path.exists(best):
+                all_ckpt_paths.append(best)
+
+        if not all_ckpt_paths:
+            raise FileNotFoundError(
+                f"No checkpoints found for {self.monkey_name} in {base}")
+
+        # Detect architecture from first checkpoint
+        first_sd = torch.load(all_ckpt_paths[0], map_location=device, weights_only=True)
+        use_revin, hidden_dim, num_heads, num_layers, d_ff = self._detect_arch(first_sd)
+        self.use_revin = use_revin
+
+        for path in all_ckpt_paths:
+            m = self._make_model(use_revin=use_revin, hidden_dim=hidden_dim,
+                                 num_heads=num_heads, num_layers=num_layers, d_ff=d_ff)
+            state_dict = torch.load(path, map_location=device, weights_only=True)
             m.load_state_dict(state_dict)
             m.to(device)
             m.eval()
             self.models.append(m)
-            print(f"Loaded single best model (revin={self.use_revin})")
+
+        print(f"Loaded {len(self.models)} models for ensemble "
+              f"(revin={use_revin}, hidden={hidden_dim}, heads={num_heads}, "
+              f"layers={num_layers}, d_ff={d_ff})")
 
     def predict(self, x):
         """
@@ -336,7 +455,7 @@ class Model:
         # Mask future
         x_norm[:, context_len:] = x_norm[:, context_len - 1: context_len]
 
-        # Run inference: average predictions from all snapshot models
+        # Run inference: average predictions from all models
         batch_size = 16 if self.num_channels > 200 else 32
         all_preds = []
 
@@ -349,12 +468,13 @@ class Model:
                     predictions.append(pred_norm.cpu().numpy())
             all_preds.append(np.concatenate(predictions, axis=0))
 
-        # Average across snapshots
+        # Average across all models
         pred_norm_all = np.mean(all_preds, axis=0)  # (N, T, C)
 
         # Denormalize with TTA stats
-        # Note: if RevIN is enabled, model already denormalizes internally
-        # via instance stats. We still apply TTA denorm for the global scale.
         pred_raw = denormalize_lmp(pred_norm_all, mean, std, f)
+
+        # Prediction smoothing: gentle EMA on forecast window
+        pred_raw = smooth_predictions(pred_raw, alpha=0.15)
 
         return pred_raw
