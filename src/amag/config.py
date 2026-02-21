@@ -51,9 +51,14 @@ class TrainConfig:
     num_features: int = 9
 
     # Model
-    hidden_dim: int = 64
-    dropout: float = 0.0
+    hidden_dim: int = 128
+    d_ff: int = 512
+    num_heads: int = 4
+    num_layers: int = 2
+    dropout: float = 0.1
     use_adaptor: bool = False
+    use_channel_attn: bool = True
+    use_feature_pathways: bool = True
 
     # Training
     batch_size: int = 16
@@ -94,8 +99,21 @@ class TrainConfig:
     # OOD: RevIN (Kim et al., ICLR 2022)
     use_revin: bool = False
 
-    # OOD: CORAL loss (Sun & Saenko, ECCV 2016)
-    coral_lambda: float = 0.0
+    # OOD: MMD loss (Gretton et al., JMLR 2012)
+    mmd_lambda: float = 0.0
+
+    # Spectral loss weight
+    spectral_lambda: float = 0.0
+
+    # Loss type: "mse" or "huber"
+    loss_type: str = "mse"
+
+    # Session embeddings
+    use_session_embed: bool = False
+    num_sessions: int = 3
+
+    # Warmup epochs (linear warmup from 0 to lr)
+    warmup_epochs: int = 0
 
     # Output
     checkpoint_dir: str = "checkpoints"
@@ -104,8 +122,15 @@ class TrainConfig:
 def phase1_config() -> TrainConfig:
     """Paper-faithful AMAG config (Li et al., NeurIPS 2023)."""
     return TrainConfig(
-        # Model: enable adaptor per paper
+        # Model: enable adaptor per paper, paper hidden_dim=64, single layer/head
+        hidden_dim=64,
+        d_ff=256,
+        num_heads=1,
+        num_layers=1,
+        dropout=0.0,
         use_adaptor=True,
+        use_channel_attn=False,
+        use_feature_pathways=False,
         # Optimizer: Adam (Kingma & Ba, ICLR 2015) — paper specifies Adam, not AdamW
         optimizer_type="adam",
         weight_decay=1e-5,
@@ -125,31 +150,43 @@ def phase1_config() -> TrainConfig:
         aug_scale_std=0.0,
         aug_channel_drop_p=0.0,
         use_revin=False,
-        coral_lambda=0.0,
+        mmd_lambda=0.0,
+        spectral_lambda=0.0,
+        loss_type="mse",
+        use_session_embed=False,
+        warmup_epochs=0,
     )
 
 
 def phase2_config() -> TrainConfig:
     """Competition config with OOD extensions for cross-date generalization."""
     return TrainConfig(
-        # Model: adaptor off (overfits on small cross-date sets)
+        # Model: deeper multi-head transformer, larger hidden dim
+        hidden_dim=128,
+        d_ff=512,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.1,
         use_adaptor=False,
+        use_channel_attn=True,
+        use_feature_pathways=True,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
         weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 50 epochs)
+        # Scheduler: CosineAnnealingWarmRestarts (5 cycles of 60 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=150,
+        epochs=300,
         val_every=5,
-        patience=20,
+        patience=40,
+        warmup_epochs=10,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=10,
         # Snapshot ensemble (Huang et al., ICLR 2017)
-        num_snapshots=3,
-        snapshot_cycle_len=50,
+        num_snapshots=5,
+        snapshot_cycle_len=60,
         # Augmentation
         aug_jitter_std=0.02,
         aug_scale_std=0.1,
@@ -159,6 +196,13 @@ def phase2_config() -> TrainConfig:
         mixup_alpha=0.3,
         # OOD: RevIN (Kim et al., ICLR 2022)
         use_revin=True,
-        # OOD: CORAL (Sun & Saenko, ECCV 2016)
-        coral_lambda=0.1,
+        # OOD: MMD loss (Gretton et al., JMLR 2012)
+        mmd_lambda=0.05,
+        # Spectral loss
+        spectral_lambda=0.1,
+        # Huber loss for robustness
+        loss_type="huber",
+        # Session embeddings
+        use_session_embed=True,
+        num_sessions=3,
     )

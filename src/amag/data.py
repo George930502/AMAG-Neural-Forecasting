@@ -78,7 +78,8 @@ class NeuralForecastDataset(Dataset):
                  augment: bool = False,
                  jitter_std: float = 0.02,
                  scale_std: float = 0.1,
-                 channel_drop_p: float = 0.1):
+                 channel_drop_p: float = 0.1,
+                 freq_augment: bool = False):
         """
         Args:
             data_norm: (N, T, C, F) already normalized data
@@ -98,6 +99,7 @@ class NeuralForecastDataset(Dataset):
         self.jitter_std = jitter_std
         self.scale_std = scale_std
         self.channel_drop_p = channel_drop_p
+        self.freq_augment = freq_augment
 
     def __len__(self):
         return len(self.data_norm)
@@ -107,6 +109,9 @@ class NeuralForecastDataset(Dataset):
 
         if self.augment:
             x = self._apply_augmentation(x)
+
+        if self.freq_augment and self.augment:
+            x = self._apply_freq_augmentation(x)
 
         # Mask future: replace steps after context with copy of last context step
         x[self.context_len:] = x[self.context_len - 1]
@@ -147,6 +152,22 @@ class NeuralForecastDataset(Dataset):
 
         return x
 
+    def _apply_freq_augmentation(self, x: np.ndarray) -> np.ndarray:
+        """Apply phase perturbation in frequency domain.
+
+        Preserves spectral content while creating diverse training samples.
+        Better than Gaussian jitter for OOD generalization.
+
+        Args:
+            x: (T, C, F) normalized data
+        Returns:
+            Augmented (T, C, F)
+        """
+        X_fft = np.fft.rfft(x, axis=0)  # FFT along time axis
+        phase_noise = np.random.uniform(-0.1 * np.pi, 0.1 * np.pi, X_fft.shape)
+        X_fft = X_fft * np.exp(1j * phase_noise)
+        return np.fft.irfft(X_fft, n=x.shape[0], axis=0).astype(np.float32)
+
 
 def load_all_train_data(dataset_dir: str, train_files: list[str]) -> list[np.ndarray]:
     """Load all training data files for a monkey."""
@@ -165,7 +186,8 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
                      augment: bool = False,
                      jitter_std: float = 0.02,
                      scale_std: float = 0.1,
-                     channel_drop_p: float = 0.1):
+                     channel_drop_p: float = 0.1,
+                     freq_augment: bool = False):
     """Load and prepare train/val datasets with per-session normalization.
 
     Each session is normalized independently using its own statistics.
@@ -222,6 +244,7 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
         jitter_std=jitter_std,
         scale_std=scale_std,
         channel_drop_p=channel_drop_p,
+        freq_augment=freq_augment,
     )
     val_ds = NeuralForecastDataset(val_norm, val_raw, context_len)
 

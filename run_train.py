@@ -4,6 +4,7 @@ Usage:
     python run_train.py beignet --phase paper    # Phase 1: paper-faithful reproduction
     python run_train.py affi --phase compete     # Phase 2: OOD competition config
     python run_train.py beignet                  # Default: Phase 2 (compete)
+    python run_train.py beignet --seeds 42 123 456  # Multi-seed ensemble
 """
 import sys
 import argparse
@@ -22,6 +23,8 @@ def main():
                              "compete = Phase 2 (OOD extensions)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
+                        help="Train with multiple seeds for ensemble diversity")
     args = parser.parse_args()
 
     if args.phase == "paper":
@@ -36,11 +39,21 @@ def main():
     cfg.cooldown_ms = 50
 
     if args.monkey == "affi":
-        cfg.batch_size = 8   # 239 channels = heavy
+        cfg.batch_size = 4   # 239 channels + hidden_dim=128 = heavy
     else:
-        cfg.batch_size = 16  # 89 channels = moderate
+        cfg.batch_size = 8   # 89 channels + hidden_dim=128
 
-    train_monkey(args.monkey, cfg)
+    seeds = args.seeds or [cfg.seed]
+    for i, seed in enumerate(seeds):
+        if len(seeds) > 1:
+            print(f"\n{'='*60}")
+            print(f"  Seed {i+1}/{len(seeds)}: {seed}")
+            print(f"{'='*60}")
+            # Save to different checkpoint dirs for multi-seed
+            cfg.checkpoint_dir = f"checkpoints/seed_{seed}"
+
+        cfg.seed = seed
+        train_monkey(args.monkey, cfg)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 """Codabench-compatible submission model.
 
 Self-contained AMAG model definition + inference with TTA normalization.
-Phase 2: Snapshot ensemble (averages predictions from 3 snapshots).
-Optional RevIN (Kim et al., ICLR 2022) for distribution shift handling.
+Phase 3: Deeper multi-head transformer, channel attention, feature pathways,
+snapshot ensemble (5 snapshots), test-time adaptation.
 
 Expected files alongside this script:
-  - amag_{monkey}_snap1.pth, amag_{monkey}_snap2.pth, amag_{monkey}_snap3.pth
+  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap5.pth
   - Falls back to amag_{monkey}_best.pth if snapshots not found
 """
 
@@ -18,21 +18,21 @@ import torch.nn as nn
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ---- RevIN (Kim et al., ICLR 2022) ----
+# ---- RevIN (Kim et al., ICLR 2022) — context-only stats ----
 class RevIN(nn.Module):
-    """Reversible Instance Normalization for time-series distribution shift."""
-
-    def __init__(self, num_channels, eps=1e-5):
+    def __init__(self, num_channels, eps=1e-5, context_len=10):
         super().__init__()
         self.eps = eps
+        self.context_len = context_len
         self.affine_weight = nn.Parameter(torch.ones(1, 1, num_channels))
         self.affine_bias = nn.Parameter(torch.zeros(1, 1, num_channels))
         self._mean = None
         self._std = None
 
     def normalize(self, x):
-        self._mean = x.mean(dim=1, keepdim=True)
-        self._std = (x.var(dim=1, keepdim=True, unbiased=False) + self.eps).sqrt()
+        context = x[:, :self.context_len]
+        self._mean = context.mean(dim=1, keepdim=True)
+        self._std = (context.var(dim=1, keepdim=True, unbiased=False) + self.eps).sqrt()
         x_norm = (x - self._mean) / self._std
         return x_norm * self.affine_weight + self.affine_bias
 
@@ -59,61 +59,86 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 
-# ---- Transformer Block ----
+# ---- Transformer Block (multi-head, pre-norm) ----
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, d_ff=256):
+    def __init__(self, d_model, d_ff=256, num_heads=1, dropout=0.0):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
-        self.scale = math.sqrt(d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = math.sqrt(self.head_dim)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.attn_drop = nn.Dropout(0.0)
-        self.ffn_drop = nn.Dropout(0.0)
+        self.attn_drop = nn.Dropout(dropout)
+        self.ffn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.ReLU(), nn.Dropout(0.0),
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_ff, d_model))
 
     def forward(self, x):
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        B, T, D = x.shape
+        x_norm = self.norm1(x)
+        q = self.q_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         attn = torch.softmax(q @ k.transpose(-2, -1) / self.scale, dim=-1)
         attn = self.attn_drop(attn)
-        x = self.norm1(x + attn @ v)
-        x = self.norm2(x + self.ffn_drop(self.ffn(x)))
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, D)
+        out = self.out_proj(out)
+        x = x + self.resid_drop(out)
+        x = x + self.resid_drop(self.ffn(self.norm2(x)))
         return x
 
 
-# ---- TE ----
+# ---- TE (multi-layer, feature pathways) ----
 class TemporalEncoder(nn.Module):
-    def __init__(self, input_dim=9, hidden_dim=64, d_ff=256):
+    def __init__(self, input_dim=9, hidden_dim=64, d_ff=256,
+                 num_heads=1, num_layers=1, dropout=0.0,
+                 use_feature_pathways=False):
         super().__init__()
-        self.embed = nn.Linear(input_dim, hidden_dim)
+        self.use_feature_pathways = use_feature_pathways
+        if use_feature_pathways:
+            half = hidden_dim // 2
+            self.embed_lmp = nn.Linear(1, half)
+            self.embed_spec = nn.Linear(input_dim - 1, hidden_dim - half)
+            self.embed_fuse = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.embed = nn.Linear(input_dim, hidden_dim)
         self.pe = PositionalEncoding(hidden_dim)
-        self.transformer = TransformerBlock(hidden_dim, d_ff)
+        self.layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, d_ff, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
 
     def forward(self, x):
         B, T, C, F = x.shape
         x = x.permute(0, 2, 1, 3).reshape(B * C, T, F)
-        h = self.transformer(self.pe(self.embed(x)))
+        if self.use_feature_pathways:
+            lmp = x[:, :, :1]
+            spec = x[:, :, 1:]
+            h = torch.cat([self.embed_lmp(lmp), self.embed_spec(spec)], dim=-1)
+            h = self.embed_fuse(h)
+        else:
+            h = self.embed(x)
+        h = self.pe(h)
+        for layer in self.layers:
+            h = layer(h)
         return h.reshape(B, C, T, -1).permute(0, 2, 1, 3)
 
 
 # ---- Adaptor MLP ----
 class AdaptorMLP(nn.Module):
-    """S^(u,v) = sigma(MLP([H^(u), H^(v)])) in [0, 1]."""
     def __init__(self, input_dim):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
-        )
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, 256), nn.ReLU(),
+            nn.Linear(256, 64), nn.ReLU(),
+            nn.Linear(64, 1), nn.Sigmoid())
 
     def forward(self, x):
         return self.mlp(x)
@@ -170,54 +195,101 @@ class SpatialInteraction(nn.Module):
         ], dim=-1)
         s = self.adaptor(pair.reshape(-1, 2 * TD)).view(B, C, v_size)
         w = s * self.A_a[:, v_start:v_end].unsqueeze(0)
-        a_chunk = torch.einsum("buv,btud->btvd", w, h)
-        return a_chunk
+        return torch.einsum("buv,btud->btvd", w, h)
 
 
-# ---- TR ----
+# ---- Channel Attention (iTransformer-style) ----
+class ChannelAttention(nn.Module):
+    def __init__(self, hidden_dim=64, num_heads=4, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.scale = math.sqrt(self.head_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
+
+    def forward(self, z):
+        B, T, C, D = z.shape
+        z_flat = z.reshape(B * T, C, D)
+        z_norm = self.norm(z_flat)
+        q = self.q_proj(z_norm).view(B * T, C, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(z_norm).view(B * T, C, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(z_norm).view(B * T, C, self.num_heads, self.head_dim).transpose(1, 2)
+        attn = torch.softmax(q @ k.transpose(-2, -1) / self.scale, dim=-1)
+        attn = self.attn_drop(attn)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B * T, C, D)
+        out = self.out_proj(out)
+        return (z_flat + self.resid_drop(out)).reshape(B, T, C, D)
+
+
+# ---- TR (multi-layer) ----
 class TemporalReadout(nn.Module):
-    def __init__(self, hidden_dim=64, d_ff=256):
+    def __init__(self, hidden_dim=64, d_ff=256, num_heads=1, num_layers=1, dropout=0.0):
         super().__init__()
         self.pe = PositionalEncoding(hidden_dim)
-        self.transformer = TransformerBlock(hidden_dim, d_ff)
+        self.layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, d_ff, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
         self.output_fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, z):
         B, T, C, D = z.shape
         z = z.permute(0, 2, 1, 3).reshape(B * C, T, D)
-        r = self.transformer(self.pe(z))
+        r = self.pe(z)
+        for layer in self.layers:
+            r = layer(r)
         pred = self.output_fc(r).squeeze(-1)
         return pred.reshape(B, C, T).permute(0, 2, 1)
 
 
 # ---- Full AMAG ----
 class AMAG(nn.Module):
-    def __init__(self, num_channels, num_features=9, hidden_dim=64, d_ff=256,
-                 total_len=20, use_adaptor=False, adaptor_chunk_size=8,
-                 use_revin=False):
+    def __init__(self, num_channels, num_features=9, hidden_dim=128, d_ff=512,
+                 num_heads=4, num_layers=2, total_len=20,
+                 use_adaptor=False, adaptor_chunk_size=8,
+                 use_revin=False, use_channel_attn=True,
+                 use_feature_pathways=True,
+                 use_session_embed=False, num_sessions=3,
+                 dropout=0.1):
         super().__init__()
         self.use_revin = use_revin
+        self.use_channel_attn = use_channel_attn
+        self.use_session_embed = use_session_embed
         if use_revin:
             self.revin = RevIN(num_channels)
-        self.te = TemporalEncoder(num_features, hidden_dim, d_ff)
+        if use_session_embed:
+            self.session_embed = nn.Embedding(num_sessions, hidden_dim)
+        self.te = TemporalEncoder(num_features, hidden_dim, d_ff,
+                                   num_heads, num_layers, dropout,
+                                   use_feature_pathways)
         self.si = SpatialInteraction(num_channels, hidden_dim, total_len,
                                      use_adaptor, adaptor_chunk_size)
-        self.tr = TemporalReadout(hidden_dim, d_ff)
+        if use_channel_attn:
+            self.channel_attn = ChannelAttention(hidden_dim, num_heads, dropout)
+        self.tr = TemporalReadout(hidden_dim, d_ff, num_heads, num_layers, dropout)
 
-    def forward(self, x):
+    def forward(self, x, session_ids=None):
         if self.use_revin:
             lmp = x[:, :, :, 0]
             lmp_norm = self.revin.normalize(lmp)
             x = x.clone()
             x[:, :, :, 0] = lmp_norm
-
         h = self.te(x)
+        if self.use_session_embed and session_ids is not None:
+            se = self.session_embed(session_ids)
+            h = h + se[:, None, None, :]
         z = self.si(h)
+        if self.use_channel_attn:
+            z = self.channel_attn(z)
         pred = self.tr(z)
-
         if self.use_revin:
             pred = self.revin.denormalize(pred)
-
         return pred
 
 
@@ -255,63 +327,116 @@ class Model:
             raise ValueError(f"Unknown monkey: {monkey_name}")
 
         self.models = []
-        self.use_revin = False  # Detected from checkpoint
+        self.model_config = {}  # Detected from checkpoint
 
-    def _make_model(self, use_revin=False):
+    def _detect_config(self, state_dict):
+        """Detect model configuration from checkpoint state dict."""
+        config = {
+            "use_revin": any(k.startswith("revin.") for k in state_dict),
+            "use_channel_attn": any(k.startswith("channel_attn.") for k in state_dict),
+            "use_session_embed": any(k.startswith("session_embed.") for k in state_dict),
+            "use_feature_pathways": "te.embed_lmp.weight" in state_dict,
+        }
+
+        # Detect hidden_dim from TE embed output
+        if config["use_feature_pathways"]:
+            config["hidden_dim"] = state_dict["te.embed_fuse.weight"].shape[0]
+        else:
+            config["hidden_dim"] = state_dict["te.embed.weight"].shape[0]
+
+        # Detect num_layers from transformer layer keys
+        te_layer_ids = set()
+        for k in state_dict:
+            if k.startswith("te.layers."):
+                layer_id = int(k.split(".")[2])
+                te_layer_ids.add(layer_id)
+        config["num_layers"] = max(te_layer_ids) + 1 if te_layer_ids else 1
+
+        # Detect num_heads from out_proj existence (multi-head has out_proj)
+        if "te.layers.0.out_proj.weight" in state_dict:
+            # Infer heads from q_proj shape vs head_dim
+            d_model = state_dict["te.layers.0.q_proj.weight"].shape[0]
+            config["d_ff"] = state_dict["te.layers.0.ffn.0.weight"].shape[0]
+            # Check channel_attn head_dim to infer num_heads
+            if config["use_channel_attn"] and "channel_attn.q_proj.weight" in state_dict:
+                # Use stored head count from model
+                config["num_heads"] = 4  # Default for phase2
+            else:
+                config["num_heads"] = 1
+        elif "te.transformer.out_proj.weight" in state_dict:
+            config["num_heads"] = 4
+            config["d_ff"] = state_dict["te.transformer.ffn.0.weight"].shape[0]
+            config["num_layers"] = 1
+        else:
+            # Legacy single-head model (no out_proj)
+            config["num_heads"] = 1
+            config["d_ff"] = 256
+
+        # Detect num_sessions
+        if config["use_session_embed"]:
+            config["num_sessions"] = state_dict["session_embed.weight"].shape[0]
+        else:
+            config["num_sessions"] = 3
+
+        return config
+
+    def _make_model(self, config):
         """Create a fresh AMAG model instance matching trained config."""
         chunk = 4 if self.num_channels > 200 else 8
         return AMAG(
             num_channels=self.num_channels,
             num_features=9,
-            hidden_dim=64,
-            d_ff=256,
+            hidden_dim=config.get("hidden_dim", 128),
+            d_ff=config.get("d_ff", 512),
+            num_heads=config.get("num_heads", 4),
+            num_layers=config.get("num_layers", 2),
             total_len=20,
             use_adaptor=False,
             adaptor_chunk_size=chunk,
-            use_revin=use_revin,
+            use_revin=config.get("use_revin", False),
+            use_channel_attn=config.get("use_channel_attn", True),
+            use_feature_pathways=config.get("use_feature_pathways", True),
+            use_session_embed=config.get("use_session_embed", False),
+            num_sessions=config.get("num_sessions", 3),
+            dropout=0.0,  # No dropout at inference
         )
-
-    def _detect_revin(self, state_dict):
-        """Check if checkpoint was trained with RevIN."""
-        return any(k.startswith("revin.") for k in state_dict.keys())
 
     def load(self):
         base = os.path.dirname(__file__)
 
-        # Try loading 3 snapshot checkpoints for ensemble
+        # Try loading up to 5 snapshot checkpoints for ensemble
         snapshot_paths = [
             os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
-            for i in range(1, 4)
+            for i in range(1, 6)
         ]
 
         snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
 
         if len(snapshots_found) >= 2:
-            # Detect RevIN from first snapshot
+            # Detect config from first snapshot
             first_sd = torch.load(snapshots_found[0], map_location=device, weights_only=True)
-            self.use_revin = self._detect_revin(first_sd)
+            self.model_config = self._detect_config(first_sd)
 
             for path in snapshots_found:
-                m = self._make_model(use_revin=self.use_revin)
+                m = self._make_model(self.model_config)
                 state_dict = torch.load(path, map_location=device, weights_only=True)
                 m.load_state_dict(state_dict)
                 m.to(device)
                 m.eval()
                 self.models.append(m)
-            print(f"Loaded {len(self.models)} snapshot models for ensemble "
-                  f"(revin={self.use_revin})")
+            print(f"Loaded {len(self.models)} snapshot models (config={self.model_config})")
         else:
             # Fallback: single best checkpoint
             weight_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
             state_dict = torch.load(weight_path, map_location=device, weights_only=True)
-            self.use_revin = self._detect_revin(state_dict)
+            self.model_config = self._detect_config(state_dict)
 
-            m = self._make_model(use_revin=self.use_revin)
+            m = self._make_model(self.model_config)
             m.load_state_dict(state_dict)
             m.to(device)
             m.eval()
             self.models.append(m)
-            print(f"Loaded single best model (revin={self.use_revin})")
+            print(f"Loaded single best model (config={self.model_config})")
 
     def predict(self, x):
         """
@@ -337,7 +462,7 @@ class Model:
         x_norm[:, context_len:] = x_norm[:, context_len - 1: context_len]
 
         # Run inference: average predictions from all snapshot models
-        batch_size = 16 if self.num_channels > 200 else 32
+        batch_size = 8 if self.num_channels > 200 else 16
         all_preds = []
 
         for model in self.models:
@@ -353,8 +478,6 @@ class Model:
         pred_norm_all = np.mean(all_preds, axis=0)  # (N, T, C)
 
         # Denormalize with TTA stats
-        # Note: if RevIN is enabled, model already denormalizes internally
-        # via instance stats. We still apply TTA denorm for the global scale.
         pred_raw = denormalize_lmp(pred_norm_all, mean, std, f)
 
         return pred_raw

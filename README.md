@@ -1,6 +1,6 @@
 # AMAG Neural Forecasting
 
-Forecasting neural activity from micro-electrocorticography (µECoG) recordings using **AMAG** (Additive, Multiplicative and Adaptive Graph Neural Network) with **RevIN** and **CORAL** for cross-session generalization.
+Forecasting neural activity from micro-electrocorticography (µECoG) recordings using **AMAG** (Additive, Multiplicative and Adaptive Graph Neural Network) with deep multi-head transformers, channel attention, and cross-session domain adaptation.
 
 **Competition:** NSF HDR Hackathon 2025 — Neural Forecasting Challenge
 **Paper:** Li et al., "AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity", NeurIPS 2023
@@ -8,21 +8,36 @@ Forecasting neural activity from micro-electrocorticography (µECoG) recordings 
 ## Architecture
 
 ```
-Input (B, 20, C, 9) → TE (Transformer) → SI (Add + Modulator) → TR (Transformer) → Output (B, 20, C)
+Input (B, 20, C, 9)
+  → Feature Pathways (LMP + Spectral split embedding)
+  → TE (2-layer, 4-head Transformer with pre-norm)
+  → Session Embedding (additive, for cross-day adaptation)
+  → SI (Add + Modulator with learnable adjacency)
+  → Channel Attention (iTransformer-style cross-channel mixing)
+  → TR (2-layer, 4-head Transformer with pre-norm)
+  → Output (B, 20, C)
 ```
 
-- **TE (Temporal Encoder):** FC embedding + sinusoidal positional encoding + single-head self-attention
-- **SI (Spatial Interaction):** Additive message-passing with learnable adjacency + multiplicative (Hadamard) message-passing + optional Adaptor MLP gating
+- **TE (Temporal Encoder):** Split LMP/spectral feature embedding → sinusoidal PE → 2 stacked multi-head self-attention blocks (4 heads, d=128, pre-norm, GELU)
+- **SI (Spatial Interaction):** Additive message-passing with learnable adjacency + multiplicative (Hadamard) message-passing
+- **Channel Attention:** iTransformer-style cross-channel self-attention per timestep — sample-dependent spatial mixing
 - **TR (Temporal Readout):** Same structure as TE with separate parameters, projects to LMP predictions
+- **RevIN:** Context-only instance normalization (stats from first 10 timesteps only)
 
-### OOD Extensions
+### OOD / Domain Adaptation Methods
 
 | Method | Citation | Purpose |
 |--------|----------|---------|
-| **RevIN** | Kim et al., ICLR 2022 | Instance normalization to handle distribution shift across sessions |
-| **CORAL** | Sun & Saenko, ECCV 2016 | Aligns covariance of hidden features between sessions |
+| **RevIN** (context-only) | Kim et al., ICLR 2022 | Instance normalization using context window stats only |
+| **MMD** | Gretton et al., JMLR 2012 | Multi-kernel Maximum Mean Discrepancy for domain alignment |
+| **Spectral Loss** | — | FFT magnitude MSE auxiliary loss for frequency content |
+| **Session Embeddings** | Ye et al., NeurIPS 2023 | Learnable per-session embeddings for cross-day adaptation |
+| **Channel Attention** | Liu et al., ICLR 2024 | iTransformer-style sample-dependent spatial mixing |
+| **Feature Pathways** | — | Separate LMP and spectral band embedding |
+| **Freq Augmentation** | Xu et al., ICLR 2024 | Phase perturbation in frequency domain |
+| **Huber Loss** | Huber, 1964 | Robust regression, less sensitive to outliers |
 | **EMA** | Polyak & Juditsky, 1992 | Smoothed weight averaging for stable generalization |
-| **Snapshot Ensemble** | Huang et al., ICLR 2017 | Averages predictions from 3 cosine cycle checkpoints |
+| **Snapshot Ensemble** | Huang et al., ICLR 2017 | Averages predictions from 5 cosine cycle checkpoints |
 | **Mixup** | Zhang et al., ICLR 2018 | Interpolates training samples for regularization |
 
 ## Setup
@@ -67,49 +82,71 @@ Each `.npz` file contains `arr_0` with shape `(N, 20, C, 9)`:
 
 ### Phase 1: Paper-Faithful Reproduction
 
-Matches the original AMAG paper settings (Adam, StepLR, adaptor enabled, no augmentation).
+Matches the original AMAG paper settings (Adam, StepLR, single-head single-layer d=64, adaptor enabled, no augmentation).
 
 ```bash
 uv run python run_train.py beignet --phase paper
 uv run python run_train.py affi --phase paper
 ```
 
-### Phase 2: Competition (OOD Extensions)
+### Phase 2: Competition (v3 — Full OOD Extensions)
 
-Adds RevIN, CORAL, EMA, mixup, snapshot ensemble, and augmentation for cross-date generalization.
+Deep multi-head transformer, channel attention, feature pathways, MMD, spectral loss, Huber loss, session embeddings, frequency augmentation, snapshot ensemble.
 
 ```bash
-uv run python run_train.py beignet --phase compete
-uv run python run_train.py affi --phase compete
+# Train beignet (89 channels)
+uv run python run_train.py beignet
+
+# Train affi (239 channels)
+uv run python run_train.py affi
+
+# Override epochs
+uv run python run_train.py beignet --epochs 200
+
+# Multi-seed ensemble (trains 3 separate runs, checkpoints in checkpoints/seed_<N>/)
+uv run python run_train.py beignet --seeds 42 123 456
 ```
 
 ### Options
 
 ```bash
-uv run python run_train.py <monkey> --phase <paper|compete> [--epochs N]
+uv run python run_train.py <monkey> --phase <paper|compete> [--epochs N] [--seeds S1 S2 ...]
 ```
 
 | Argument | Values | Default |
 |----------|--------|---------|
 | `monkey` | `beignet`, `affi` | `beignet` |
 | `--phase` | `paper`, `compete` | `compete` |
-| `--epochs` | any integer | 500 (paper), 150 (compete) |
+| `--epochs` | any integer | 500 (paper), 300 (compete) |
+| `--seeds` | space-separated ints | `42` |
 
 ### Configuration Summary
 
 | Parameter | Phase 1 (paper) | Phase 2 (compete) |
 |-----------|-----------------|-------------------|
+| Hidden dim | 64 | 128 |
+| Attention heads | 1 | 4 |
+| Transformer layers | 1 | 2 |
+| d_ff | 256 | 512 |
+| Dropout | 0.0 | 0.1 |
 | Optimizer | Adam | AdamW |
-| Scheduler | StepLR (x0.95/50ep) | CosineWarmRestarts (T0=50) |
+| Scheduler | StepLR (x0.95/50ep) | CosineWarmRestarts (T0=60) |
 | Weight decay | 1e-5 | 1e-4 |
-| Epochs | 500 | 150 |
+| Epochs | 500 | 300 |
+| Warmup | None | 10 epochs (linear) |
+| Patience | 50 | 40 |
 | Adaptor | Enabled | Disabled |
-| RevIN | Off | On |
-| CORAL lambda | 0 | 0.1 |
+| Feature pathways | Off | On (LMP + spectral split) |
+| Channel attention | Off | On (4-head cross-channel) |
+| Session embeddings | Off | On |
+| RevIN | Off | On (context-only stats) |
+| MMD lambda | 0 | 0.05 |
+| Spectral lambda | 0 | 0.1 |
+| Loss | MSE | Huber (SmoothL1) |
 | EMA | Off | On (decay=0.999) |
 | Mixup | Off | On (alpha=0.3) |
-| Augmentation | Off | Jitter + scale + channel dropout |
-| Snapshots | None | 3 (at cycle minima) |
+| Augmentation | Off | Jitter + scale + channel dropout + freq phase |
+| Snapshots | None | 5 (at cycle minima) |
 
 ## Evaluation
 
@@ -141,30 +178,31 @@ The `submission/model.py` is self-contained (no imports from `src/`). It impleme
 ```python
 class Model:
     def __init__(self, monkey_name):  # 'beignet' or 'affi'
-    def load(self):                    # Load snapshot checkpoints
+    def load(self):                    # Auto-detects config from checkpoint, loads ensemble
     def predict(self, x):              # (N, 20, C, 9) → (N, 20, C)
 ```
 
-Inference pipeline: TTA normalization (stats from context window) → snapshot ensemble (3 models averaged) → denormalization.
+Inference pipeline: TTA normalization (context-window stats) → snapshot ensemble (up to 5 models averaged) → denormalization.
 
 ## Project Structure
 
 ```
-├── run_train.py                  # Training entry point (--phase paper|compete)
+├── run_train.py                  # Training entry point (--phase paper|compete, --seeds)
 ├── pyproject.toml                # Dependencies (numpy, scipy, tqdm, torch)
 ├── src/amag/
 │   ├── config.py                 # TrainConfig + phase1_config() + phase2_config()
-│   ├── model.py                  # AMAG model with optional RevIN
-│   ├── train.py                  # Training loop (EMA, mixup, CORAL, thermal mgmt)
+│   ├── model.py                  # AMAG model (RevIN, channel attn, session embed)
+│   ├── train.py                  # Training loop (EMA, mixup, MMD, spectral, warmup)
 │   ├── data.py                   # Dataset loading, normalization, augmentation
 │   ├── adjacency.py              # Correlation matrix initialization
-│   ├── losses.py                 # CORAL loss (Sun & Saenko, ECCV 2016)
+│   ├── losses.py                 # MMD loss + spectral loss
 │   ├── evaluate.py               # Local evaluation using submission model
 │   └── modules/
-│       ├── temporal_encoding.py  # TE: FC + positional encoding + transformer
-│       ├── spatial_interaction.py # SI: Add + Modulator + Adaptor + adjacency
-│       ├── temporal_readout.py   # TR: transformer + output FC
-│       └── revin.py              # RevIN (Kim et al., ICLR 2022)
+│       ├── temporal_encoding.py  # TE: feature pathways + PE + multi-head transformer
+│       ├── spatial_interaction.py # SI: Add + Modulator + adjacency
+│       ├── temporal_readout.py   # TR: multi-head transformer + output FC
+│       ├── channel_attention.py  # iTransformer-style cross-channel attention
+│       └── revin.py              # RevIN with context-only normalization
 ├── submission/
 │   └── model.py                  # Self-contained submission (no src/ imports)
 ├── CLAUDE.md                     # Paper reproduction guide
@@ -181,12 +219,19 @@ Designed for sustained training on laptop GPUs (tested on RTX 4090 Laptop):
 - **Gradient checkpointing** — used in Adaptor MLP for memory efficiency
 - **cudnn.benchmark** — autotuner for fixed-size inputs
 
+Approximate VRAM usage (Phase 2):
+- Beignet (89ch, batch=8): ~730 MB
+- Affi (239ch, batch=4): ~1030 MB
+
 ## References
 
 - Li et al., "AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity", NeurIPS 2023
 - Kim et al., "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift", ICLR 2022
-- Sun & Saenko, "Deep CORAL: Correlation Alignment for Deep Domain Adaptation", ECCV 2016
-- Kingma & Ba, "Adam: A Method for Stochastic Optimization", ICLR 2015
+- Gretton et al., "A Kernel Two-Sample Test", JMLR 2012
+- Liu et al., "iTransformer: Inverted Transformers Are Effective for Time Series Forecasting", ICLR 2024
+- Ye et al., "Neural Data Transformer 2", NeurIPS 2023
+- Xu et al., "FITS: Modeling Time Series with 10k Parameters", ICLR 2024
 - Loshchilov & Hutter, "Decoupled Weight Decay Regularization", ICLR 2019
 - Zhang et al., "mixup: Beyond Empirical Risk Minimization", ICLR 2018
 - Huang et al., "Snapshot Ensembles: Train 1, Get M for Free", ICLR 2017
+- Polyak & Juditsky, "Acceleration of Stochastic Approximation by Averaging", 1992

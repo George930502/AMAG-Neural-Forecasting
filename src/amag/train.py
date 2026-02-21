@@ -10,7 +10,7 @@ from .config import TrainConfig, MONKEY_CONFIGS
 from .data import prepare_datasets, denormalize_torch, compute_norm_stats
 from .adjacency import compute_correlation_matrix
 from .model import AMAG
-from .losses import compute_coral_from_hidden
+from .losses import compute_mmd_from_hidden, spectral_loss
 
 
 def get_gpu_temp():
@@ -93,7 +93,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     print(f"Training {monkey_name} on {device} (AMP: {use_amp}, dtype: {amp_dtype})")
     print(f"{phase_label}: optimizer={cfg.optimizer_type}, scheduler={cfg.scheduler_type}, "
           f"adaptor={cfg.use_adaptor}, revin={cfg.use_revin}, "
-          f"coral={cfg.coral_lambda}, EMA={cfg.use_ema}, Mixup={cfg.use_mixup}")
+          f"mmd={cfg.mmd_lambda}, spectral={cfg.spectral_lambda}, "
+          f"EMA={cfg.use_ema}, Mixup={cfg.use_mixup}, "
+          f"hidden_dim={cfg.hidden_dim}, heads={cfg.num_heads}, layers={cfg.num_layers}, "
+          f"loss={cfg.loss_type}, channel_attn={cfg.use_channel_attn}, "
+          f"feature_paths={cfg.use_feature_pathways}")
 
     # Enable cudnn autotuner for fixed-size inputs (all trials same shape)
     if device.type == "cuda":
@@ -113,6 +117,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         jitter_std=cfg.aug_jitter_std,
         scale_std=cfg.aug_scale_std,
         channel_drop_p=cfg.aug_channel_drop_p,
+        freq_augment=True,  # Enable frequency augmentation for compete mode
     )
     print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
 
@@ -136,24 +141,33 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     # Adaptor chunk size: smaller for large channel counts to save memory
     adaptor_chunk = 4 if C > 200 else 8
 
+    # Determine num_sessions from data
+    num_sessions = len(monkey_cfg.train_files)
+
     # Build model
     model = AMAG(
         num_channels=C,
         num_features=cfg.num_features,
         hidden_dim=cfg.hidden_dim,
+        d_ff=cfg.d_ff,
+        num_heads=cfg.num_heads,
+        num_layers=cfg.num_layers,
         total_len=cfg.total_len,
         corr_matrix=corr_tensor,
         dropout=cfg.dropout,
         use_adaptor=cfg.use_adaptor,
         adaptor_chunk_size=adaptor_chunk,
         use_revin=cfg.use_revin,
+        use_channel_attn=cfg.use_channel_attn,
+        use_feature_pathways=cfg.use_feature_pathways,
+        use_session_embed=cfg.use_session_embed,
+        num_sessions=num_sessions,
     ).to(device)
 
-    # Keep reference to raw module for CORAL path (needs sub-module access)
+    # Keep reference to raw module for sub-module access
     raw_model = model
 
     # torch.compile for fused kernels (15-20% speedup, one-time cost)
-    # Requires Triton; falls back to eager mode if unavailable
     if device.type == "cuda":
         try:
             import triton  # noqa: F401
@@ -167,32 +181,37 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
     # Optimizer selection
     if cfg.optimizer_type == "adam":
-        # Adam (Kingma & Ba, ICLR 2015) — paper specification
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
                                      weight_decay=cfg.weight_decay)
     else:
-        # AdamW with decoupled weight decay (Loshchilov & Hutter, ICLR 2019)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                        weight_decay=cfg.weight_decay)
 
     # Scheduler selection
     if cfg.scheduler_type == "step":
-        # StepLR: x0.95 every 50 epochs — paper specification
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=cfg.lr_decay_every, gamma=cfg.lr_decay)
     else:
-        # CosineAnnealingWarmRestarts for snapshot ensemble (Huang et al. ICLR 2017)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=cfg.snapshot_cycle_len, T_mult=1)
 
-    # Note: GradScaler is unnecessary with bfloat16 (same exponent range as fp32,
-    # no overflow risk). Removing it avoids per-batch scale/unscale/update overhead.
+    # Warmup scheduler (linear warmup)
+    if cfg.warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0,
+            total_iters=cfg.warmup_epochs)
 
     # EMA model
     ema = EMAModel(model, decay=cfg.ema_decay) if cfg.use_ema else None
 
-    criterion = nn.MSELoss()
-    use_coral = cfg.coral_lambda > 0
+    # Loss function selection
+    if cfg.loss_type == "huber":
+        criterion = nn.SmoothL1Loss(beta=1.0)
+    else:
+        criterion = nn.MSELoss()
+
+    use_mmd = cfg.mmd_lambda > 0
+    use_spectral = cfg.spectral_lambda > 0
 
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -222,7 +241,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         # --- Train ---
         model.train()
         train_loss_sum = 0.0
-        train_coral_sum = 0.0
+        train_mmd_sum = 0.0
+        train_spec_sum = 0.0
         train_count = 0
 
         # Reset mixup iterator each epoch (reuses existing DataLoader)
@@ -254,24 +274,34 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 )
 
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                # CORAL: need TE hidden states (use raw_model for sub-module access)
-                if use_coral and session_ids is not None:
-                    h = raw_model.get_te_hidden(x)
+                # Session IDs for model and MMD
+                sess_ids_device = session_ids.to(device) if session_ids is not None else None
+
+                if use_mmd and session_ids is not None:
+                    h = raw_model.get_te_hidden(x, sess_ids_device)
                     z = raw_model.si(h)
+                    if raw_model.use_channel_attn:
+                        z = raw_model.channel_attn(z)
                     pred = raw_model.tr(z)
                     if raw_model.use_revin:
                         pred = raw_model.revin.denormalize(pred)
-                    coral_l = compute_coral_from_hidden(h, session_ids.to(device))
+                    mmd_l = compute_mmd_from_hidden(h, sess_ids_device)
                 else:
-                    pred = model(x)
-                    coral_l = torch.tensor(0.0, device=device)
+                    pred = model(x, sess_ids_device)
+                    mmd_l = torch.tensor(0.0, device=device)
 
                 # Loss on forecast window only (matching competition scoring)
-                mse_loss = criterion(
-                    pred[:, cfg.context_len:],
-                    target_norm[:, cfg.context_len:],
-                )
-                loss = mse_loss + cfg.coral_lambda * coral_l
+                forecast_pred = pred[:, cfg.context_len:]
+                forecast_target = target_norm[:, cfg.context_len:]
+
+                mse_loss = criterion(forecast_pred, forecast_target)
+
+                # Spectral loss
+                spec_l = torch.tensor(0.0, device=device)
+                if use_spectral:
+                    spec_l = spectral_loss(forecast_pred, forecast_target)
+
+                loss = mse_loss + cfg.mmd_lambda * mmd_l + cfg.spectral_lambda * spec_l
                 # Scale for gradient accumulation
                 loss = loss / accumulate_steps
 
@@ -289,7 +319,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     ema.update(model)
 
             train_loss_sum += mse_loss.item() * x.size(0)
-            train_coral_sum += coral_l.item() * x.size(0)
+            train_mmd_sum += mmd_l.item() * x.size(0)
+            train_spec_sum += spec_l.item() * x.size(0)
             train_count += x.size(0)
 
             # Inter-batch cooldown to prevent thermal throttling
@@ -304,9 +335,15 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 ema.update(model)
 
-        scheduler.step()
+        # Scheduler step
+        if cfg.warmup_epochs > 0 and epoch <= cfg.warmup_epochs:
+            warmup_scheduler.step()
+        else:
+            scheduler.step()
+
         train_mse = train_loss_sum / train_count
-        train_coral_avg = train_coral_sum / train_count if use_coral else 0
+        train_mmd_avg = train_mmd_sum / train_count if use_mmd else 0
+        train_spec_avg = train_spec_sum / train_count if use_spectral else 0
 
         # Clear CUDA cache periodically to reduce memory pressure
         if epoch % 10 == 0:
@@ -349,8 +386,12 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             lr = optimizer.param_groups[0]["lr"]
             temp = get_gpu_temp()
             temp_str = f" | GPU: {temp}°C" if temp else ""
-            coral_str = f" | CORAL: {train_coral_avg:.6f}" if use_coral else ""
-            print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{coral_str} | "
+            aux_str = ""
+            if use_mmd:
+                aux_str += f" | MMD: {train_mmd_avg:.6f}"
+            if use_spectral:
+                aux_str += f" | Spec: {train_spec_avg:.6f}"
+            print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{aux_str} | "
                   f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str} | LR: {lr:.6f}{temp_str}")
 
             # Track best using whichever is better (EMA or regular)
