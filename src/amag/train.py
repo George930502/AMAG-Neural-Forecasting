@@ -203,8 +203,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     mixup_iter = None
     if cfg.use_mixup:
         mixup_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                                  shuffle=True, num_workers=0,
-                                  pin_memory=False, drop_last=True)
+                                  shuffle=True, num_workers=4,
+                                  pin_memory=True, drop_last=True,
+                                  persistent_workers=True)
 
     for epoch in range(1, cfg.epochs + 1):
         # --- Train ---
@@ -309,10 +310,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         train_mse = train_loss_sum / train_count
         train_mmd_avg = train_mmd_sum / train_count if use_mmd else 0
         train_spec_avg = train_spec_sum / train_count if use_spectral else 0
-
-        # Clear CUDA cache periodically to reduce memory pressure
-        if epoch % 10 == 0:
-            torch.cuda.empty_cache()
 
         # --- Snapshot saving at cosine cycle minima ---
         if (cfg.scheduler_type == "cosine"
@@ -433,6 +430,6 @@ if __name__ == "__main__":
     cfg = TrainConfig()
 
     if monkey == "affi":
-        cfg.batch_size = 8
+        cfg.batch_size = 16
 
     train_monkey(monkey, cfg)
