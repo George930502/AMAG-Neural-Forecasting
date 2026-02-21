@@ -138,7 +138,7 @@ def phase1_config() -> TrainConfig:
         lr=5e-4,
         lr_decay=0.95,
         lr_decay_every=50,
-        # Training: paper uses 1000 epochs, 500 is thermally safer with early stopping
+        # Training: paper uses 1000 epochs, 500 with early stopping
         epochs=500,
         val_every=10,
         patience=50,
