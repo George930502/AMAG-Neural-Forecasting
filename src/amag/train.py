@@ -1,5 +1,4 @@
 import copy
-import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -11,32 +10,6 @@ from .data import prepare_datasets, denormalize_torch, compute_norm_stats
 from .adjacency import compute_correlation_matrix
 from .model import AMAG
 from .losses import compute_mmd_from_hidden, spectral_loss
-
-
-def get_gpu_temp():
-    """Read GPU temperature via nvidia-smi. Returns int or None."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
-        return int(result.stdout.strip())
-    except Exception:
-        return None
-
-
-def thermal_pause(target_temp=80, max_wait=60):
-    """Pause if GPU temp exceeds target_temp. Wait until it drops below."""
-    temp = get_gpu_temp()
-    if temp is None or temp <= target_temp:
-        return
-    print(f"  [Thermal] GPU at {temp}°C > {target_temp}°C, cooling down...", end="", flush=True)
-    waited = 0
-    while temp is not None and temp > target_temp and waited < max_wait:
-        time.sleep(5)
-        waited += 5
-        temp = get_gpu_temp()
-    print(f" resumed at {temp}°C (waited {waited}s)")
 
 
 class EMAModel:
@@ -130,9 +103,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     accumulate_steps = cfg.accumulate_steps
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True, drop_last=True)
+                              num_workers=4, pin_memory=True, drop_last=True,
+                              persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True)
+                            num_workers=2, pin_memory=True,
+                            persistent_workers=True)
 
     # Compute correlation matrix from normalized training data
     corr = compute_correlation_matrix(train_ds.data_norm)
@@ -223,9 +198,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     snapshots_saved = 0
     last_snapshot_epoch = -1
 
-    # Inter-batch cooldown (ms) to reduce sustained GPU thermal load
-    cooldown_s = cfg.cooldown_ms / 1000.0 if cfg.cooldown_ms > 0 else 0
-
     # Persistent mixup DataLoader (reused across epochs, not recreated)
     mixup_loader = None
     mixup_iter = None
@@ -235,9 +207,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                                   pin_memory=False, drop_last=True)
 
     for epoch in range(1, cfg.epochs + 1):
-        # Thermal check at start of each epoch
-        thermal_pause(target_temp=82, max_wait=120)
-
         # --- Train ---
         model.train()
         train_loss_sum = 0.0
@@ -323,10 +292,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             train_spec_sum += spec_l.item() * x.size(0)
             train_count += x.size(0)
 
-            # Inter-batch cooldown to prevent thermal throttling
-            if cooldown_s > 0:
-                time.sleep(cooldown_s)
-
         # Flush any remaining accumulated gradients
         if accum_count > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -384,15 +349,13 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     torch.save(ema.state_dict(), save_path)
 
             lr = optimizer.param_groups[0]["lr"]
-            temp = get_gpu_temp()
-            temp_str = f" | GPU: {temp}°C" if temp else ""
             aux_str = ""
             if use_mmd:
                 aux_str += f" | MMD: {train_mmd_avg:.6f}"
             if use_spectral:
                 aux_str += f" | Spec: {train_spec_avg:.6f}"
             print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{aux_str} | "
-                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str} | LR: {lr:.6f}{temp_str}")
+                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str} | LR: {lr:.6f}")
 
             # Track best using whichever is better (EMA or regular)
             effective_mse = val_mse_raw

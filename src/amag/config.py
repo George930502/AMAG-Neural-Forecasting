@@ -70,7 +70,6 @@ class TrainConfig:
     val_split: float = 0.1
     val_every: int = 5
     seed: int = 42
-    cooldown_ms: int = 50
     patience: int = 20
     accumulate_steps: int = 1  # Gradient accumulation: effective_batch = batch_size * this
 

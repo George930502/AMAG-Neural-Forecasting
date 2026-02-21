@@ -35,13 +35,10 @@ def main():
     if args.epochs is not None:
         cfg.epochs = args.epochs
 
-    # Thermal-safe batch sizes (RTX 4090 Laptop overheats under sustained load)
-    cfg.cooldown_ms = 50
-
     if args.monkey == "affi":
-        cfg.batch_size = 4   # 239 channels + hidden_dim=128 = heavy
+        cfg.batch_size = 16  # 239 channels
     else:
-        cfg.batch_size = 8   # 89 channels + hidden_dim=128
+        cfg.batch_size = 32  # 89 channels
 
     seeds = args.seeds or [cfg.seed]
     for i, seed in enumerate(seeds):

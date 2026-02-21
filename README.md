@@ -209,19 +209,12 @@ Inference pipeline: TTA normalization (context-window stats) → snapshot ensemb
 └── TASK.md                       # Challenge task description
 ```
 
-## GPU Thermal Management
-
-Designed for sustained training on laptop GPUs (tested on RTX 4090 Laptop):
+## GPU Notes
 
 - **AMP bfloat16** — reduced compute without loss scaling overhead
-- **Inter-batch cooldown** — configurable sleep between batches (default 50ms)
-- **Thermal pause** — auto-pauses at 82°C, resumes when cooled
-- **Gradient checkpointing** — used in Adaptor MLP for memory efficiency
-- **cudnn.benchmark** — autotuner for fixed-size inputs
-
-Approximate VRAM usage (Phase 2):
-- Beignet (89ch, batch=8): ~730 MB
-- Affi (239ch, batch=4): ~1030 MB
+- **cudnn.benchmark** — autotuner enabled for fixed-size inputs
+- **DataLoader workers** — 4 workers for training, 2 for validation
+- Default batch sizes: 32 (beignet, 89ch), 16 (affi, 239ch)
 
 ## References
 
