@@ -1,12 +1,12 @@
 """Codabench-compatible submission model.
 
-Self-contained AMAG model definition + inference with TTA normalization.
-Phase 3: Deeper multi-head transformer, channel attention, feature pathways,
-snapshot ensemble (5 snapshots), test-time adaptation.
+Self-contained AMAG model definition + inference with training normalization stats.
+v3.1: Fixed normalization pipeline, no RevIN/session embeddings, quality snapshots.
 
 Expected files alongside this script:
-  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap5.pth
-  - Falls back to amag_{monkey}_best.pth if snapshots not found
+  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap3.pth
+  - amag_{monkey}_best.pth (fallback)
+  - norm_stats_{monkey}.npz (training normalization stats)
 """
 
 import os
@@ -16,6 +16,24 @@ import torch
 import torch.nn as nn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---- Positional Encoding ----
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=100):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
 
 
 # ---- RevIN (Kim et al., ICLR 2022) — context-only stats ----
@@ -39,24 +57,6 @@ class RevIN(nn.Module):
     def denormalize(self, x):
         x = (x - self.affine_bias) / self.affine_weight
         return x * self._std + self._mean
-
-
-# ---- Positional Encoding ----
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=100):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float)
-            * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
 
 
 # ---- Transformer Block (multi-head, pre-norm) ----
@@ -256,7 +256,7 @@ class AMAG(nn.Module):
                  use_revin=False, use_channel_attn=True,
                  use_feature_pathways=True,
                  use_session_embed=False, num_sessions=3,
-                 dropout=0.1):
+                 dropout=0.0):
         super().__init__()
         self.use_revin = use_revin
         self.use_channel_attn = use_channel_attn
@@ -293,8 +293,9 @@ class AMAG(nn.Module):
         return pred
 
 
-# ---- Normalization ----
+# ---- Normalization (matches training pipeline exactly) ----
 def normalize_data(data, mean, std):
+    """Normalize to [-1, 1] using [mean-4*std, mean+4*std] range."""
     n, t, c, f = data.shape
     flat = data.reshape(n * t, c * f)
     lo = mean - 4 * std
@@ -306,6 +307,7 @@ def normalize_data(data, mean, std):
 
 
 def denormalize_lmp(data, mean, std, num_features=9):
+    """Denormalize LMP from [-1, 1] back to raw scale."""
     mean_lmp = mean[0, ::num_features]
     std_lmp = std[0, ::num_features]
     lo = mean_lmp - 4 * std_lmp
@@ -327,7 +329,8 @@ class Model:
             raise ValueError(f"Unknown monkey: {monkey_name}")
 
         self.models = []
-        self.model_config = {}  # Detected from checkpoint
+        self.model_config = {}
+        self.norm_stats = None  # Per-session normalization stats from training
 
     def _detect_config(self, state_dict):
         """Detect model configuration from checkpoint state dict."""
@@ -352,15 +355,11 @@ class Model:
                 te_layer_ids.add(layer_id)
         config["num_layers"] = max(te_layer_ids) + 1 if te_layer_ids else 1
 
-        # Detect num_heads from out_proj existence (multi-head has out_proj)
+        # Detect d_ff and num_heads
         if "te.layers.0.out_proj.weight" in state_dict:
-            # Infer heads from q_proj shape vs head_dim
-            d_model = state_dict["te.layers.0.q_proj.weight"].shape[0]
             config["d_ff"] = state_dict["te.layers.0.ffn.0.weight"].shape[0]
-            # Check channel_attn head_dim to infer num_heads
             if config["use_channel_attn"] and "channel_attn.q_proj.weight" in state_dict:
-                # Use stored head count from model
-                config["num_heads"] = 4  # Default for phase2
+                config["num_heads"] = 4
             else:
                 config["num_heads"] = 1
         elif "te.transformer.out_proj.weight" in state_dict:
@@ -368,7 +367,6 @@ class Model:
             config["d_ff"] = state_dict["te.transformer.ffn.0.weight"].shape[0]
             config["num_layers"] = 1
         else:
-            # Legacy single-head model (no out_proj)
             config["num_heads"] = 1
             config["d_ff"] = 256
 
@@ -401,8 +399,28 @@ class Model:
             dropout=0.0,  # No dropout at inference
         )
 
+    def _load_norm_stats(self):
+        """Load per-session normalization stats saved during training."""
+        base = os.path.dirname(__file__)
+        stats_path = os.path.join(base, f"norm_stats_{self.monkey_name}.npz")
+        if os.path.exists(stats_path):
+            data = np.load(stats_path)
+            num_sessions = int(data["num_sessions"])
+            self.norm_stats = []
+            for i in range(num_sessions):
+                mean = data[f"mean_{i}"]
+                std = data[f"std_{i}"]
+                self.norm_stats.append((mean, std))
+            print(f"Loaded training norm stats ({num_sessions} sessions)")
+        else:
+            print(f"WARNING: norm_stats_{self.monkey_name}.npz not found, using TTA fallback")
+            self.norm_stats = None
+
     def load(self):
         base = os.path.dirname(__file__)
+
+        # Load normalization stats from training
+        self._load_norm_stats()
 
         # Try loading up to 5 snapshot checkpoints for ensemble
         snapshot_paths = [
@@ -438,6 +456,40 @@ class Model:
             self.models.append(m)
             print(f"Loaded single best model (config={self.model_config})")
 
+    def _find_best_session_stats(self, x):
+        """Find the best matching session stats for this data.
+
+        Computes correlation between data's global stats and each session's
+        training stats. Returns the best matching session's stats.
+        If norm_stats not available, falls back to context-window TTA.
+        """
+        if self.norm_stats is None:
+            # TTA fallback: compute from context window
+            context = x[:, :10]
+            n, t, c, f = context.shape
+            flat = context.reshape(n * t, c * f)
+            mean = flat.mean(axis=0, keepdims=True)
+            std = flat.std(axis=0, keepdims=True)
+            return mean, std
+
+        if len(self.norm_stats) == 1:
+            return self.norm_stats[0]
+
+        # Compute data stats for matching
+        n, t, c, f_dim = x.shape
+        flat = x.reshape(n * t, c * f_dim)
+        data_mean = flat.mean(axis=0, keepdims=True)
+
+        # Find closest session by mean correlation
+        best_corr = -1
+        best_idx = 0
+        for i, (s_mean, s_std) in enumerate(self.norm_stats):
+            corr = np.corrcoef(data_mean.flatten(), s_mean.flatten())[0, 1]
+            if corr > best_corr:
+                best_corr = corr
+                best_idx = i
+        return self.norm_stats[best_idx]
+
     def predict(self, x):
         """
         Args:
@@ -448,17 +500,13 @@ class Model:
         context_len = 10
         n, t, c, f = x.shape
 
-        # TTA: compute normalization stats from context window only
-        context = x[:, :context_len]  # (N, 10, C, F)
-        n_ctx, t_ctx, c_ctx, f_ctx = context.shape
-        flat = context.reshape(n_ctx * t_ctx, c_ctx * f_ctx)
-        mean = flat.mean(axis=0, keepdims=True)
-        std = flat.std(axis=0, keepdims=True)
+        # Find best matching normalization stats
+        mean, std = self._find_best_session_stats(x)
 
-        # Normalize full input with TTA stats
+        # Normalize using training stats (same pipeline as training)
         x_norm = normalize_data(x, mean, std)
 
-        # Mask future
+        # Mask future (same as training)
         x_norm[:, context_len:] = x_norm[:, context_len - 1: context_len]
 
         # Run inference: average predictions from all snapshot models
@@ -477,7 +525,7 @@ class Model:
         # Average across snapshots
         pred_norm_all = np.mean(all_preds, axis=0)  # (N, T, C)
 
-        # Denormalize with TTA stats
+        # Denormalize with same stats used for normalization
         pred_raw = denormalize_lmp(pred_norm_all, mean, std, f)
 
         return pred_raw

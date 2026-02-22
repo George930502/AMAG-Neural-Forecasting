@@ -70,7 +70,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
           f"EMA={cfg.use_ema}, Mixup={cfg.use_mixup}, "
           f"hidden_dim={cfg.hidden_dim}, heads={cfg.num_heads}, layers={cfg.num_layers}, "
           f"loss={cfg.loss_type}, channel_attn={cfg.use_channel_attn}, "
-          f"feature_paths={cfg.use_feature_pathways}")
+          f"feature_paths={cfg.use_feature_pathways}, "
+          f"dropout={cfg.dropout}, wd={cfg.weight_decay}")
 
     # Enable cudnn autotuner for fixed-size inputs (all trials same shape)
     if device.type == "cuda":
@@ -98,6 +99,19 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     val_mean, val_std = per_session_stats[0]
     val_mean_t = torch.from_numpy(val_mean).float().to(device)
     val_std_t = torch.from_numpy(val_std).float().to(device)
+
+    # Save per-session normalization stats alongside checkpoints
+    # so the submission model can use identical normalization
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    norm_stats_path = ckpt_dir / f"norm_stats_{monkey_name}.npz"
+    stats_dict = {}
+    for i, (m, s) in enumerate(per_session_stats):
+        stats_dict[f"mean_{i}"] = m
+        stats_dict[f"std_{i}"] = s
+    stats_dict["num_sessions"] = np.array(len(per_session_stats))
+    np.savez(str(norm_stats_path), **stats_dict)
+    print(f"Saved normalization stats to {norm_stats_path}")
 
     # Gradient accumulation: effective_batch = batch_size * accumulate_steps
     accumulate_steps = cfg.accumulate_steps
@@ -188,15 +202,14 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     use_mmd = cfg.mmd_lambda > 0
     use_spectral = cfg.spectral_lambda > 0
 
-    ckpt_dir = Path(cfg.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_val_mse = float("inf")
     best_ema_val_mse = float("inf")
     patience_counter = 0
 
-    # Snapshot tracking
+    # Snapshot tracking — with validation MSE for quality-gated saving
     snapshots_saved = 0
     last_snapshot_epoch = -1
+    snapshot_val_mses = []  # Track val MSE at each snapshot epoch
 
     # Persistent mixup DataLoader (reused across epochs, not recreated)
     mixup_loader = None
@@ -244,21 +257,17 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 )
 
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                # Session IDs for model and MMD
+                # Session IDs for model
                 sess_ids_device = session_ids.to(device) if session_ids is not None else None
 
+                # Always use the same forward path for training and evaluation
+                pred = model(x, sess_ids_device)
+                mmd_l = torch.tensor(0.0, device=device)
+
+                # MMD loss: compute from hidden states if enabled
                 if use_mmd and session_ids is not None:
                     h = raw_model.get_te_hidden(x, sess_ids_device)
-                    z = raw_model.si(h)
-                    if raw_model.use_channel_attn:
-                        z = raw_model.channel_attn(z)
-                    pred = raw_model.tr(z)
-                    if raw_model.use_revin:
-                        pred = raw_model.revin.denormalize(pred)
                     mmd_l = compute_mmd_from_hidden(h, sess_ids_device)
-                else:
-                    pred = model(x, sess_ids_device)
-                    mmd_l = torch.tensor(0.0, device=device)
 
                 # Loss on forecast window only (matching competition scoring)
                 forecast_pred = pred[:, cfg.context_len:]

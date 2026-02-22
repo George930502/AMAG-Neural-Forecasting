@@ -166,7 +166,7 @@ After training, prepare the Codabench submission:
 # Checkpoints are automatically copied to submission/ during evaluation
 # Create the zip (files only, no directory structure)
 cd submission
-zip -j ../submission.zip model.py amag_*_snap*.pth amag_*_best.pth
+zip -j ../submission.zip model.py amag_*_snap*.pth amag_*_best.pth norm_stats_*.npz
 ```
 
 Upload `submission.zip` to Codabench. The scoring script evaluates MSE on steps 10-19 across 5 test datasets (2 same-day + 3 cross-date), and the final score is their average.

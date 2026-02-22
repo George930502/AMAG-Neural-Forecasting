@@ -165,27 +165,27 @@ def phase2_config() -> TrainConfig:
         d_ff=512,
         num_heads=4,
         num_layers=2,
-        dropout=0.1,
+        dropout=0.15,
         use_adaptor=False,
         use_channel_attn=True,
         use_feature_pathways=True,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (5 cycles of 60 epochs)
+        weight_decay=1e-3,
+        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 100 epochs)
         scheduler_type="cosine",
         lr=5e-4,
         epochs=300,
         val_every=5,
-        patience=40,
+        patience=60,
         warmup_epochs=10,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
-        ema_start_epoch=10,
-        # Snapshot ensemble (Huang et al., ICLR 2017)
-        num_snapshots=5,
-        snapshot_cycle_len=60,
+        ema_start_epoch=20,
+        # Snapshot ensemble — only 3 snapshots from 100-epoch cycles
+        num_snapshots=3,
+        snapshot_cycle_len=100,
         # Augmentation
         aug_jitter_std=0.02,
         aug_scale_std=0.1,
@@ -193,15 +193,15 @@ def phase2_config() -> TrainConfig:
         # Mixup (Zhang et al., ICLR 2018)
         use_mixup=True,
         mixup_alpha=0.3,
-        # OOD: RevIN (Kim et al., ICLR 2022)
-        use_revin=True,
-        # OOD: MMD loss (Gretton et al., JMLR 2012)
-        mmd_lambda=0.05,
-        # Spectral loss
-        spectral_lambda=0.1,
-        # Huber loss for robustness
-        loss_type="huber",
-        # Session embeddings
-        use_session_embed=True,
+        # RevIN disabled — causes double normalization with TTA
+        use_revin=False,
+        # MMD disabled — session embeddings have train/eval mismatch
+        mmd_lambda=0.0,
+        # Spectral loss — reduced weight
+        spectral_lambda=0.05,
+        # MSE loss (Huber was competing with spectral loss)
+        loss_type="mse",
+        # Session embeddings disabled — train/eval mismatch
+        use_session_embed=False,
         num_sessions=3,
     )
