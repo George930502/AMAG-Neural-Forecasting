@@ -82,11 +82,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     monkey_cfg = MONKEY_CONFIGS[monkey_name]
     C = monkey_cfg.num_channels
 
-    # Use OOD validation for phase2 (cross-date sessions as val)
-    use_ood = cfg.scheduler_type == "cosine" and len(monkey_cfg.train_files) > 1
-
     # Prepare data (per-session normalization + augmentation)
-    data_result = prepare_datasets(
+    train_ds, val_ds, per_session_stats = prepare_datasets(
         dataset_dir=cfg.dataset_dir,
         train_files=monkey_cfg.train_files,
         context_len=cfg.context_len,
@@ -97,17 +94,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         scale_std=cfg.aug_scale_std,
         channel_drop_p=cfg.aug_channel_drop_p,
         freq_augment=True,  # Enable frequency augmentation for compete mode
-        ood_validation=use_ood,
     )
 
-    if use_ood:
-        train_ds, val_ds, ood_val_ds, per_session_stats = data_result
-        print(f"Train: {len(train_ds)} samples (same-day only), "
-              f"Val: {len(val_ds)} samples, OOD Val: {len(ood_val_ds)} samples")
-    else:
-        train_ds, val_ds, per_session_stats = data_result
-        ood_val_ds = None
-        print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
+    print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
 
     # Val uses primary session stats for denormalization
     val_mean, val_std = per_session_stats[0]
@@ -136,13 +125,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=2, pin_memory=True,
                             persistent_workers=True)
-
-    # OOD validation loader (cross-date sessions)
-    ood_val_loader = None
-    if ood_val_ds is not None:
-        ood_val_loader = DataLoader(ood_val_ds, batch_size=cfg.batch_size, shuffle=False,
-                                    num_workers=2, pin_memory=True,
-                                    persistent_workers=True)
 
     # Compute correlation matrix from normalized training data
     corr = compute_correlation_matrix(train_ds.data_norm)
@@ -216,7 +198,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
     best_val_mse = float("inf")
     best_ema_val_mse = float("inf")
-    best_ood_val_mse = float("inf")
     patience_counter = 0
 
     # Snapshot tracking — with validation MSE for quality-gated saving
@@ -358,16 +339,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     save_path = ckpt_dir / f"amag_{monkey_name}_ema_best.pth"
                     torch.save(_clean_state_dict(ema.state_dict()), save_path)
 
-            # OOD validation (cross-date sessions)
-            ood_mse_str = ""
-            ood_val_mse = float("inf")
-            if ood_val_loader is not None:
-                # Evaluate OOD using primary session stats (same as same-day val)
-                ood_val_mse = evaluate_raw_mse(
-                    ema.shadow if (ema is not None and epoch >= cfg.ema_start_epoch) else model,
-                    ood_val_loader, val_mean_t, val_std_t, cfg, device)
-                ood_mse_str = f" | OOD MSE: {ood_val_mse:.6f}"
-
             lr = optimizer.param_groups[0]["lr"]
             aux_str = ""
             if use_mmd:
@@ -375,16 +346,12 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if use_spectral:
                 aux_str += f" | Spec: {train_spec_avg:.6f}"
             print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{aux_str} | "
-                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str}{ood_mse_str} | LR: {lr:.6f}")
+                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str} | LR: {lr:.6f}")
 
-            # Track best: use OOD val if available (3/5 test sets are cross-date),
-            # otherwise fall back to same-day val
+            # Track best (use min of model and EMA)
             effective_mse = val_mse_raw
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 effective_mse = min(val_mse_raw, ema_val_mse)
-
-            # For early stopping, prefer OOD MSE when available
-            stopping_mse = ood_val_mse if ood_val_loader is not None else effective_mse
 
             if effective_mse < best_val_mse:
                 best_val_mse = effective_mse
@@ -396,10 +363,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 else:
                     torch.save(_clean_state_dict(model.state_dict()), save_path)
                     print(f"  -> New best! Saved to {save_path}")
-            elif ood_val_loader is not None and ood_val_mse < best_ood_val_mse:
-                # OOD improved but same-day didn't — still reset patience
-                best_ood_val_mse = ood_val_mse
-                patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= cfg.patience:

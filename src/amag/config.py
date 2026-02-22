@@ -170,27 +170,27 @@ def phase2_config() -> TrainConfig:
         d_ff=256,
         num_heads=1,
         num_layers=1,
-        dropout=0.05,
+        dropout=0.1,
         use_adaptor=False,
         use_channel_attn=False,
         use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=1e-5,  # Paper value (was 1e-3 — too aggressive)
-        # Scheduler: CosineAnnealingWarmRestarts (5 cycles of 80 epochs)
+        weight_decay=5e-5,
+        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 65 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=400,
+        epochs=200,
         val_every=5,
-        patience=80,  # Longer patience — cosine restarts cause temporary val MSE spikes
+        patience=40,
         warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=20,
-        # Snapshot ensemble — 5 snapshots from 80-epoch cycles
-        num_snapshots=5,
-        snapshot_cycle_len=80,
+        # Snapshot ensemble — 3 snapshots from 65-epoch cycles
+        num_snapshots=3,
+        snapshot_cycle_len=65,
         # Augmentation
         aug_jitter_std=0.02,
         aug_scale_std=0.1,
