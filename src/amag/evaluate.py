@@ -107,7 +107,11 @@ def evaluate_all(checkpoint_dir: str = "checkpoints",
 
 
 def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
-    """Copy checkpoint files and norm stats to submission directory."""
+    """Copy checkpoint files and norm stats to submission directory.
+
+    When seed-based checkpoints exist, removes stale top-level checkpoints
+    from submission/ to prevent config detection from loading old models.
+    """
     import shutil
 
     patterns = [f"amag_{monkey_name}_snap*.pth",
@@ -115,12 +119,26 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
                 f"amag_{monkey_name}_ema_best.pth",
                 f"norm_stats_{monkey_name}.npz"]
 
-    # Top-level checkpoints
-    for pattern in patterns:
-        for src in ckpt_dir.glob(pattern):
-            dst = sub_dir / src.name
-            if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
-                shutil.copy2(str(src), str(dst))
+    has_seed_dirs = any(d.is_dir() for d in ckpt_dir.glob("seed_*"))
+
+    if has_seed_dirs:
+        # Remove stale top-level checkpoints from submission/ to prevent
+        # config detection from loading old (wrong architecture) models
+        for pattern in patterns:
+            for stale in sub_dir.glob(pattern):
+                stale.unlink()
+        # Also remove stale seed dirs from submission/
+        for stale_seed in sub_dir.glob("seed_*"):
+            if stale_seed.is_dir():
+                shutil.rmtree(str(stale_seed))
+
+    # Top-level checkpoints (only if no seed dirs — legacy single-seed mode)
+    if not has_seed_dirs:
+        for pattern in patterns:
+            for src in ckpt_dir.glob(pattern):
+                dst = sub_dir / src.name
+                if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                    shutil.copy2(str(src), str(dst))
 
     # Seed-based checkpoints: copy into seed_* subdirs in submission/
     for seed_dir in ckpt_dir.glob("seed_*"):
