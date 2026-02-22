@@ -172,13 +172,12 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4: d=64 + Dish-TS + DANN.
+    """Competition config v4.1: d=64 + DANN (no Dish-TS).
 
-    v4 redesign: Reverted to d=64 (paper-faithful size, ~106K params) with
-    Dish-TS (Fan et al., AAAI 2023) replacing RevIN for stable learned
-    distribution coefficients, and DANN (Ganin et al., JMLR 2016) replacing
-    CORAL for adversarial session-invariant feature learning. Multi-seed
-    ensemble (3 seeds x 5 models = 15 models per monkey).
+    v4.1: Dish-TS disabled — CONET overfit to training distribution causing
+    Beignet same-day test MSE to explode (148K vs 48K target). Plain training
+    norm stats generalize better. Keep DANN for strong cross-date scores.
+    Multi-seed ensemble (3 seeds x 5 models = 15 models per monkey).
     """
     return TrainConfig(
         # Model: paper-faithful d=64 (prevents overfitting on 630-1049 samples)
@@ -214,9 +213,9 @@ def phase2_config() -> TrainConfig:
         # Mixup (Zhang et al., ICLR 2018)
         use_mixup=True,
         mixup_alpha=0.2,
-        # Dish-TS (Fan et al., AAAI 2023) — learned distribution coefficients
+        # No instance normalization — Dish-TS CONET overfit, RevIN unstable
         use_revin=False,
-        use_dish_ts=True,
+        use_dish_ts=False,
         # DANN (Ganin et al., JMLR 2016) — domain-adversarial training
         use_dann=True,
         dann_lambda=0.1,
