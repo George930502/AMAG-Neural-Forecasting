@@ -9,7 +9,7 @@ from .config import TrainConfig, MONKEY_CONFIGS
 from .data import prepare_datasets, denormalize_torch, compute_norm_stats
 from .adjacency import compute_correlation_matrix
 from .model import AMAG
-from .losses import compute_mmd_from_hidden, spectral_loss
+from .losses import compute_mmd_from_hidden, compute_coral_from_hidden, spectral_loss
 
 
 def _clean_state_dict(state_dict):
@@ -72,7 +72,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     print(f"Training {monkey_name} on {device}")
     print(f"{phase_label}: optimizer={cfg.optimizer_type}, scheduler={cfg.scheduler_type}, "
           f"adaptor={cfg.use_adaptor}, revin={cfg.use_revin}, "
-          f"mmd={cfg.mmd_lambda}, spectral={cfg.spectral_lambda}, "
+          f"mmd={cfg.mmd_lambda}, coral={cfg.coral_lambda}, "
+          f"consistency={cfg.use_consistency}(λ={cfg.consist_lambda}), "
+          f"spectral={cfg.spectral_lambda}, "
           f"EMA={cfg.use_ema}, Mixup={cfg.use_mixup}, "
           f"hidden_dim={cfg.hidden_dim}, heads={cfg.num_heads}, layers={cfg.num_layers}, "
           f"loss={cfg.loss_type}, channel_attn={cfg.use_channel_attn}, "
@@ -200,6 +202,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         criterion = nn.MSELoss()
 
     use_mmd = cfg.mmd_lambda > 0
+    use_coral = cfg.coral_lambda > 0
+    use_consistency = cfg.use_consistency and cfg.consist_lambda > 0
     use_spectral = cfg.spectral_lambda > 0
 
     best_val_mse = float("inf")
@@ -224,6 +228,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         model.train()
         train_loss_sum = 0.0
         train_mmd_sum = 0.0
+        train_coral_sum = 0.0
+        train_consist_sum = 0.0
         train_spec_sum = 0.0
         train_count = 0
 
@@ -261,11 +267,24 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             # Always use the same forward path for training and evaluation
             pred = model(x, sess_ids_device)
             mmd_l = torch.tensor(0.0, device=device)
+            coral_l = torch.tensor(0.0, device=device)
+            consist_l = torch.tensor(0.0, device=device)
 
             # MMD loss: compute from hidden states if enabled
             if use_mmd and session_ids is not None:
                 h = raw_model.get_te_hidden(x, sess_ids_device)
                 mmd_l = compute_mmd_from_hidden(h, sess_ids_device)
+
+            # CORAL loss: align covariance across sessions
+            if use_coral and session_ids is not None:
+                h = raw_model.get_te_hidden(x, sess_ids_device)
+                coral_l = compute_coral_from_hidden(h, sess_ids_device)
+
+            # Consistency regularization: second forward with different augmentation noise
+            if use_consistency:
+                pred2 = model(x, sess_ids_device)
+                consist_l = nn.functional.mse_loss(
+                    pred[:, cfg.context_len:], pred2[:, cfg.context_len:])
 
             # Loss on forecast window only (matching competition scoring)
             forecast_pred = pred[:, cfg.context_len:]
@@ -278,7 +297,10 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if use_spectral:
                 spec_l = spectral_loss(forecast_pred, forecast_target)
 
-            loss = mse_loss + cfg.mmd_lambda * mmd_l + cfg.spectral_lambda * spec_l
+            loss = (mse_loss + cfg.mmd_lambda * mmd_l
+                    + cfg.coral_lambda * coral_l
+                    + cfg.consist_lambda * consist_l
+                    + cfg.spectral_lambda * spec_l)
             # Scale for gradient accumulation
             loss = loss / accumulate_steps
 
@@ -297,6 +319,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
             train_loss_sum += mse_loss.item() * x.size(0)
             train_mmd_sum += mmd_l.item() * x.size(0)
+            train_coral_sum += coral_l.item() * x.size(0)
+            train_consist_sum += consist_l.item() * x.size(0)
             train_spec_sum += spec_l.item() * x.size(0)
             train_count += x.size(0)
 
@@ -324,6 +348,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
         train_mse = train_loss_sum / train_count
         train_mmd_avg = train_mmd_sum / train_count if use_mmd else 0
+        train_coral_avg = train_coral_sum / train_count if use_coral else 0
+        train_consist_avg = train_consist_sum / train_count if use_consistency else 0
         train_spec_avg = train_spec_sum / train_count if use_spectral else 0
 
         # --- Validate ---
@@ -349,6 +375,10 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             aux_str = ""
             if use_mmd:
                 aux_str += f" | MMD: {train_mmd_avg:.6f}"
+            if use_coral:
+                aux_str += f" | CORAL: {train_coral_avg:.6f}"
+            if use_consistency:
+                aux_str += f" | Consist: {train_consist_avg:.6f}"
             if use_spectral:
                 aux_str += f" | Spec: {train_spec_avg:.6f}"
             print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{aux_str} | "

@@ -427,13 +427,76 @@ class Model:
             print(f"WARNING: norm_stats_{self.monkey_name}.npz not found, using TTA fallback")
             self.norm_stats = None
 
+    def _collect_seed_checkpoints(self, base):
+        """Collect checkpoints from seed_* subdirectories (multi-seed ensemble).
+
+        Returns list of (path, is_best_or_ema) tuples.
+        """
+        all_paths = []
+
+        # Look for seed_* directories
+        seed_dirs = sorted([
+            d for d in os.listdir(base)
+            if d.startswith("seed_") and os.path.isdir(os.path.join(base, d))
+        ])
+
+        if not seed_dirs:
+            return all_paths
+
+        for seed_dir in seed_dirs:
+            seed_path = os.path.join(base, seed_dir)
+            best_path = os.path.join(seed_path, f"amag_{self.monkey_name}_best.pth")
+            ema_best_path = os.path.join(seed_path, f"amag_{self.monkey_name}_ema_best.pth")
+
+            # Collect best/ema_best
+            ref_path = None
+            if os.path.exists(best_path):
+                all_paths.append(best_path)
+                ref_path = best_path
+            if os.path.exists(ema_best_path):
+                all_paths.append(ema_best_path)
+                if ref_path is None:
+                    ref_path = ema_best_path
+
+            # Collect snapshots (mtime-filtered, capped at 4 per seed)
+            snapshot_paths = [
+                os.path.join(seed_path, f"amag_{self.monkey_name}_snap{i}.pth")
+                for i in range(1, 10)
+            ]
+            snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
+            if ref_path and snapshots_found:
+                ref_mtime = os.path.getmtime(ref_path)
+                snapshots_found = [
+                    p for p in snapshots_found
+                    if abs(os.path.getmtime(p) - ref_mtime) < 7200
+                ]
+            snapshots_found = snapshots_found[:4]
+            all_paths.extend(snapshots_found)
+
+            # Also load norm stats from first seed dir found
+            norm_path = os.path.join(seed_path, f"norm_stats_{self.monkey_name}.npz")
+            if os.path.exists(norm_path) and self.norm_stats is None:
+                data = np.load(norm_path)
+                num_sessions = int(data["num_sessions"])
+                self.norm_stats = []
+                for i in range(num_sessions):
+                    mean = data[f"mean_{i}"]
+                    std = data[f"std_{i}"]
+                    self.norm_stats.append((mean, std))
+                print(f"Loaded training norm stats from {seed_dir} ({num_sessions} sessions)")
+
+        return all_paths
+
     def load(self):
         base = os.path.dirname(__file__)
 
-        # Load normalization stats from training
+        # Load normalization stats from training (top-level first)
         self._load_norm_stats()
 
-        # Always try to load best model first (for config detection)
+        # Collect checkpoints from multi-seed directories first
+        seed_paths = self._collect_seed_checkpoints(base)
+
+        # Also collect top-level checkpoints (single-seed or legacy)
         best_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
         ema_best_path = os.path.join(base, f"amag_{self.monkey_name}_ema_best.pth")
 
@@ -444,32 +507,36 @@ class Model:
         elif os.path.exists(ema_best_path):
             config_sd = torch.load(ema_best_path, map_location=device, weights_only=True)
 
-        # Try loading snapshot checkpoints for ensemble
+        # Top-level snapshots
         snapshot_paths = [
             os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
-            for i in range(1, 10)  # Search up to 9
+            for i in range(1, 10)
         ]
         snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
 
-        # Filter snapshots by recency: only keep those from the same training run
-        # as the best model (within 2 hours mtime difference)
         ref_path = best_path if os.path.exists(best_path) else (
             ema_best_path if os.path.exists(ema_best_path) else None)
         if ref_path and snapshots_found:
             ref_mtime = os.path.getmtime(ref_path)
             snapshots_found = [
                 p for p in snapshots_found
-                if abs(os.path.getmtime(p) - ref_mtime) < 7200  # 2 hours
+                if abs(os.path.getmtime(p) - ref_mtime) < 7200
             ]
-        snapshots_found = snapshots_found[:3]  # Cap at 3 snapshots
+        snapshots_found = snapshots_found[:4]
 
-        # Collect all unique checkpoint paths: best + snapshots
+        # Combine: top-level + seed paths (no duplicates)
         all_paths = []
         if os.path.exists(best_path):
             all_paths.append(best_path)
         if os.path.exists(ema_best_path):
             all_paths.append(ema_best_path)
         all_paths.extend(snapshots_found)
+        # Add seed-based checkpoints
+        seen = set(os.path.abspath(p) for p in all_paths)
+        for p in seed_paths:
+            if os.path.abspath(p) not in seen:
+                all_paths.append(p)
+                seen.add(os.path.abspath(p))
 
         if not all_paths:
             raise FileNotFoundError(f"No checkpoints found for {self.monkey_name}")
@@ -490,7 +557,7 @@ class Model:
             m.eval()
             self.models.append(m)
 
-        print(f"Loaded {len(self.models)} models (best + snapshots, config={self.model_config})")
+        print(f"Loaded {len(self.models)} models (multi-seed ensemble, config={self.model_config})")
 
     def _find_best_session_stats(self, x):
         """Find the best matching session stats for this data.

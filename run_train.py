@@ -40,7 +40,13 @@ def main():
     else:
         cfg.batch_size = 32  # 89 channels
 
-    seeds = args.seeds or [cfg.seed]
+    # Default to 3 seeds for compete phase (multi-seed ensemble)
+    if args.seeds:
+        seeds = args.seeds
+    elif args.phase == "compete":
+        seeds = [42, 123, 456]
+    else:
+        seeds = [cfg.seed]
     for i, seed in enumerate(seeds):
         if len(seeds) > 1:
             print(f"\n{'='*60}")

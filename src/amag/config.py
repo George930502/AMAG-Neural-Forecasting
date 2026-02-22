@@ -101,6 +101,13 @@ class TrainConfig:
     # OOD: MMD loss (Gretton et al., JMLR 2012)
     mmd_lambda: float = 0.0
 
+    # OOD: CORAL loss (Sun & Saenko, ECCV 2016)
+    coral_lambda: float = 0.0
+
+    # Consistency regularization (Laine & Aila, ICLR 2017)
+    use_consistency: bool = False
+    consist_lambda: float = 0.0
+
     # Spectral loss weight
     spectral_lambda: float = 0.0
 
@@ -158,55 +165,60 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config: paper-sized model (d=64) + OOD extensions.
+    """Competition config v4: d=96 model + RevIN + CORAL + consistency.
 
-    v3.2: Reverted from d=128/2-layer/4-head (925K params, overfitting) back to
-    paper architecture (d=64/1-layer/1-head, ~106K params). Kept good v3.1
-    additions (norm stats pipeline, augmentation, EMA, cosine scheduler).
+    v4: Increased capacity (d=96, ~200K params) with stronger regularization
+    stack (dropout=0.15, wd=1e-4, CORAL, consistency, RevIN). Multi-seed
+    ensemble (3 seeds x 5 models = 15 models per monkey) for robust predictions.
     """
     return TrainConfig(
-        # Model: paper architecture (d=64, 1 layer, 1 head)
-        hidden_dim=64,
-        d_ff=256,
+        # Model: increased capacity (d=96, 1 layer, 1 head, ~200K params)
+        hidden_dim=96,
+        d_ff=384,
         num_heads=1,
         num_layers=1,
-        dropout=0.1,  # v3.5: restored from v3.3 (paper's 0.0 is for 3x more data)
+        dropout=0.15,
         use_adaptor=False,
         use_channel_attn=False,
         use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=5e-5,  # v3.5: restored from v3.3 (630 same-day samples needs more reg)
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 65 epochs)
+        weight_decay=1e-4,
+        # Scheduler: CosineAnnealingWarmRestarts (4 cycles of 60 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=200,
+        epochs=250,
         val_every=5,
         patience=40,
-        warmup_epochs=5,
+        warmup_epochs=10,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=20,
-        # Snapshot ensemble — 3 snapshots from 65-epoch cycles
-        num_snapshots=3,
-        snapshot_cycle_len=65,
+        # Snapshot ensemble — 4 snapshots from 60-epoch cycles
+        num_snapshots=4,
+        snapshot_cycle_len=60,
         # Augmentation
         aug_jitter_std=0.02,
-        aug_scale_std=0.1,  # v3.5: restored from v3.3
-        aug_channel_drop_p=0.1,  # v3.5: restored from v3.3
-        # Mixup (Zhang et al., ICLR 2018) — reduced alpha
+        aug_scale_std=0.1,
+        aug_channel_drop_p=0.1,
+        # Mixup (Zhang et al., ICLR 2018)
         use_mixup=True,
         mixup_alpha=0.2,
-        # RevIN disabled — causes double normalization with TTA
-        use_revin=False,
-        # MMD disabled — session embeddings have train/eval mismatch
+        # RevIN (Kim et al., ICLR 2022) — context-only stats
+        use_revin=True,
+        # CORAL (Sun & Saenko, ECCV 2016) — session-invariant features
+        coral_lambda=0.1,
+        # Consistency regularization (Laine & Aila, ICLR 2017)
+        use_consistency=True,
+        consist_lambda=0.5,
+        # MMD disabled — replaced by CORAL
         mmd_lambda=0.0,
-        # Spectral loss disabled — competes with MSE at small model size
+        # Spectral loss disabled
         spectral_lambda=0.0,
         # MSE loss
         loss_type="mse",
-        # Session embeddings disabled — train/eval mismatch
+        # Session embeddings disabled
         use_session_embed=False,
         num_sessions=3,
     )
