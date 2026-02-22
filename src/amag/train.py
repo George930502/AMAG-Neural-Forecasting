@@ -68,10 +68,8 @@ def _unpack_batch(batch):
 
 def train_monkey(monkey_name: str, cfg: TrainConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16
     phase_label = "Phase 1 (paper)" if cfg.optimizer_type == "adam" else "Phase 2 (compete)"
-    print(f"Training {monkey_name} on {device} (AMP: {use_amp}, dtype: {amp_dtype})")
+    print(f"Training {monkey_name} on {device}")
     print(f"{phase_label}: optimizer={cfg.optimizer_type}, scheduler={cfg.scheduler_type}, "
           f"adaptor={cfg.use_adaptor}, revin={cfg.use_revin}, "
           f"mmd={cfg.mmd_lambda}, spectral={cfg.spectral_lambda}, "
@@ -80,10 +78,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
           f"loss={cfg.loss_type}, channel_attn={cfg.use_channel_attn}, "
           f"feature_paths={cfg.use_feature_pathways}, "
           f"dropout={cfg.dropout}, wd={cfg.weight_decay}")
-
-    # Enable cudnn autotuner for fixed-size inputs (all trials same shape)
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
 
     monkey_cfg = MONKEY_CONFIGS[monkey_name]
     C = monkey_cfg.num_channels
@@ -183,15 +177,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     # Keep reference to raw module for sub-module access
     raw_model = model
 
-    # torch.compile for fused kernels (15-20% speedup, one-time cost)
-    if device.type == "cuda":
-        try:
-            import triton  # noqa: F401
-            model = torch.compile(model)
-            print("torch.compile: enabled")
-        except (ImportError, Exception) as e:
-            print(f"torch.compile: skipped ({type(e).__name__})")
-
     param_count = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     print(f"Model parameters: {param_count:,}")
 
@@ -283,33 +268,32 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     alpha=cfg.mixup_alpha,
                 )
 
-            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                # Session IDs for model
-                sess_ids_device = session_ids.to(device) if session_ids is not None else None
+            # Session IDs for model
+            sess_ids_device = session_ids.to(device) if session_ids is not None else None
 
-                # Always use the same forward path for training and evaluation
-                pred = model(x, sess_ids_device)
-                mmd_l = torch.tensor(0.0, device=device)
+            # Always use the same forward path for training and evaluation
+            pred = model(x, sess_ids_device)
+            mmd_l = torch.tensor(0.0, device=device)
 
-                # MMD loss: compute from hidden states if enabled
-                if use_mmd and session_ids is not None:
-                    h = raw_model.get_te_hidden(x, sess_ids_device)
-                    mmd_l = compute_mmd_from_hidden(h, sess_ids_device)
+            # MMD loss: compute from hidden states if enabled
+            if use_mmd and session_ids is not None:
+                h = raw_model.get_te_hidden(x, sess_ids_device)
+                mmd_l = compute_mmd_from_hidden(h, sess_ids_device)
 
-                # Loss on forecast window only (matching competition scoring)
-                forecast_pred = pred[:, cfg.context_len:]
-                forecast_target = target_norm[:, cfg.context_len:]
+            # Loss on forecast window only (matching competition scoring)
+            forecast_pred = pred[:, cfg.context_len:]
+            forecast_target = target_norm[:, cfg.context_len:]
 
-                mse_loss = criterion(forecast_pred, forecast_target)
+            mse_loss = criterion(forecast_pred, forecast_target)
 
-                # Spectral loss
-                spec_l = torch.tensor(0.0, device=device)
-                if use_spectral:
-                    spec_l = spectral_loss(forecast_pred, forecast_target)
+            # Spectral loss
+            spec_l = torch.tensor(0.0, device=device)
+            if use_spectral:
+                spec_l = spectral_loss(forecast_pred, forecast_target)
 
-                loss = mse_loss + cfg.mmd_lambda * mmd_l + cfg.spectral_lambda * spec_l
-                # Scale for gradient accumulation
-                loss = loss / accumulate_steps
+            loss = mse_loss + cfg.mmd_lambda * mmd_l + cfg.spectral_lambda * spec_l
+            # Scale for gradient accumulation
+            loss = loss / accumulate_steps
 
             loss.backward()
             accum_count += 1
@@ -359,16 +343,14 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         if epoch % cfg.val_every == 0 or epoch == 1:
             model.eval()
             val_mse_raw = evaluate_raw_mse(
-                model, val_loader, val_mean_t, val_std_t, cfg, device,
-                use_amp=use_amp, amp_dtype=amp_dtype)
+                model, val_loader, val_mean_t, val_std_t, cfg, device)
 
             # Also evaluate EMA model
             ema_mse_str = ""
             ema_val_mse = float("inf")
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 ema_val_mse = evaluate_raw_mse(
-                    ema.shadow, val_loader, val_mean_t, val_std_t, cfg, device,
-                    use_amp=use_amp, amp_dtype=amp_dtype)
+                    ema.shadow, val_loader, val_mean_t, val_std_t, cfg, device)
                 ema_mse_str = f" | EMA MSE: {ema_val_mse:.6f}"
 
                 if ema_val_mse < best_ema_val_mse:
@@ -383,8 +365,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 # Evaluate OOD using primary session stats (same as same-day val)
                 ood_val_mse = evaluate_raw_mse(
                     ema.shadow if (ema is not None and epoch >= cfg.ema_start_epoch) else model,
-                    ood_val_loader, val_mean_t, val_std_t, cfg, device,
-                    use_amp=use_amp, amp_dtype=amp_dtype)
+                    ood_val_loader, val_mean_t, val_std_t, cfg, device)
                 ood_mse_str = f" | OOD MSE: {ood_val_mse:.6f}"
 
             lr = optimizer.param_groups[0]["lr"]
@@ -467,8 +448,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     return model
 
 
-def evaluate_raw_mse(model, loader, mean_t, std_t, cfg, device, use_amp=False,
-                     amp_dtype=torch.bfloat16):
+def evaluate_raw_mse(model, loader, mean_t, std_t, cfg, device):
     """Evaluate MSE in raw (denormalized) space, matching Codabench scoring."""
     model.eval()
     total_se = 0.0
@@ -480,10 +460,8 @@ def evaluate_raw_mse(model, loader, mean_t, std_t, cfg, device, use_amp=False,
             x = x.to(device)
             target_raw = target_raw.to(device)
 
-            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                pred_norm = model(x)
+            pred_norm = model(x)
 
-            # Denormalize in fp32
             pred_norm = pred_norm.float()
             pred_raw = denormalize_torch(
                 pred_norm, mean_t, std_t, num_features=cfg.num_features)
