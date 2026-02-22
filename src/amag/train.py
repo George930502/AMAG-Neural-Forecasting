@@ -12,6 +12,14 @@ from .model import AMAG
 from .losses import compute_mmd_from_hidden, spectral_loss
 
 
+def _clean_state_dict(state_dict):
+    """Strip '_orig_mod.' prefix added by torch.compile."""
+    cleaned = {}
+    for k, v in state_dict.items():
+        cleaned[k.removeprefix("_orig_mod.")] = v
+    return cleaned
+
+
 class EMAModel:
     """Exponential Moving Average of model weights.
 
@@ -328,9 +336,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             snapshots_saved += 1
             snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
             if ema is not None and epoch >= cfg.ema_start_epoch:
-                torch.save(ema.state_dict(), snap_path)
+                torch.save(_clean_state_dict(ema.state_dict()), snap_path)
             else:
-                torch.save(model.state_dict(), snap_path)
+                torch.save(_clean_state_dict(model.state_dict()), snap_path)
             last_snapshot_epoch = epoch
             print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved at epoch {epoch}")
 
@@ -352,7 +360,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 if ema_val_mse < best_ema_val_mse:
                     best_ema_val_mse = ema_val_mse
                     save_path = ckpt_dir / f"amag_{monkey_name}_ema_best.pth"
-                    torch.save(ema.state_dict(), save_path)
+                    torch.save(_clean_state_dict(ema.state_dict()), save_path)
 
             lr = optimizer.param_groups[0]["lr"]
             aux_str = ""
@@ -373,10 +381,10 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 patience_counter = 0
                 save_path = ckpt_dir / f"amag_{monkey_name}_best.pth"
                 if ema is not None and epoch >= cfg.ema_start_epoch and ema_val_mse <= val_mse_raw:
-                    torch.save(ema.state_dict(), save_path)
+                    torch.save(_clean_state_dict(ema.state_dict()), save_path)
                     print(f"  -> New best (EMA)! Saved to {save_path}")
                 else:
-                    torch.save(model.state_dict(), save_path)
+                    torch.save(_clean_state_dict(model.state_dict()), save_path)
                     print(f"  -> New best! Saved to {save_path}")
             else:
                 patience_counter += 1
@@ -390,9 +398,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             snapshots_saved += 1
             snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
             if ema is not None:
-                torch.save(ema.state_dict(), snap_path)
+                torch.save(_clean_state_dict(ema.state_dict()), snap_path)
             else:
-                torch.save(model.state_dict(), snap_path)
+                torch.save(_clean_state_dict(model.state_dict()), snap_path)
             print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved (final)")
 
     print(f"\nTraining complete. Best val MSE (raw): {best_val_mse:.6f}")
