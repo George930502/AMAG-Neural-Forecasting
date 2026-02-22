@@ -170,13 +170,13 @@ def phase2_config() -> TrainConfig:
         d_ff=256,
         num_heads=1,
         num_layers=1,
-        dropout=0.05,  # v3.4: reduced from 0.1 (paper uses 0.0; 0.05 is moderate)
+        dropout=0.1,  # v3.5: restored from v3.3 (paper's 0.0 is for 3x more data)
         use_adaptor=False,
         use_channel_attn=False,
         use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=1e-5,  # v3.4: reduced from 5e-5 (match paper value for d=64)
+        weight_decay=5e-5,  # v3.5: restored from v3.3 (630 same-day samples needs more reg)
         # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 65 epochs)
         scheduler_type="cosine",
         lr=5e-4,
@@ -193,8 +193,8 @@ def phase2_config() -> TrainConfig:
         snapshot_cycle_len=65,
         # Augmentation
         aug_jitter_std=0.02,
-        aug_scale_std=0.05,  # v3.4: reduced from 0.1 (too aggressive for d=64)
-        aug_channel_drop_p=0.05,  # v3.4: reduced from 0.1
+        aug_scale_std=0.1,  # v3.5: restored from v3.3
+        aug_channel_drop_p=0.1,  # v3.5: restored from v3.3
         # Mixup (Zhang et al., ICLR 2018) — reduced alpha
         use_mixup=True,
         mixup_alpha=0.2,

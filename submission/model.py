@@ -1,7 +1,7 @@
 """Codabench-compatible submission model.
 
 Self-contained AMAG model definition + inference with training normalization stats.
-v3.4: Mtime-filtered snapshots, weighted ensemble (2x for best), TTA (5 passes).
+v3.5: Mtime-filtered snapshots, weighted ensemble (2x for best), no TTA.
 
 Expected files alongside this script:
   - amag_{monkey}_snap1.pth .. amag_{monkey}_snap3.pth (quality-gated, mtime-filtered)
@@ -553,35 +553,21 @@ class Model:
         total_w = sum(weights)
         weights = [w / total_w for w in weights]
 
-        # Test-time augmentation: 1 clean + 4 jittered forward passes per model
-        n_tta = 5
+        # Single clean forward pass per model (no TTA — hurts overfit models)
         batch_size = 8 if self.num_channels > 200 else 16
 
         weighted_sum = np.zeros((n, t, c), dtype=np.float64)
 
         for model_idx, model in enumerate(self.models):
-            model_preds = []
-            for tta_i in range(n_tta):
-                x_aug = x_norm.copy()
-                if tta_i > 0:
-                    # Add small noise to context window only
-                    noise = np.random.randn(
-                        n, context_len, c, f
-                    ).astype(np.float32) * 0.005
-                    x_aug[:, :context_len] = x_aug[:, :context_len] + noise
-
-                predictions = []
-                with torch.no_grad():
-                    for i in range(0, n, batch_size):
-                        batch = torch.from_numpy(
-                            x_aug[i:i + batch_size]).to(device)
-                        pred_norm = model(batch)  # (B, T, C)
-                        predictions.append(pred_norm.cpu().numpy())
-                model_preds.append(np.concatenate(predictions, axis=0))
-
-            # Average TTA passes for this model, then apply weight
-            model_avg = np.mean(model_preds, axis=0)
-            weighted_sum += weights[model_idx] * model_avg
+            predictions = []
+            with torch.no_grad():
+                for i in range(0, n, batch_size):
+                    batch = torch.from_numpy(
+                        x_norm[i:i + batch_size]).to(device)
+                    pred_norm = model(batch)  # (B, T, C)
+                    predictions.append(pred_norm.cpu().numpy())
+            model_pred = np.concatenate(predictions, axis=0)
+            weighted_sum += weights[model_idx] * model_pred
 
         pred_norm_all = weighted_sum.astype(np.float32)
 

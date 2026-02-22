@@ -389,13 +389,16 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 if best_val_mse == float("inf") or current_snap_mse <= best_val_mse * 1.5:
                     snapshots_saved += 1
                     snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
-                    if ema is not None and epoch >= cfg.ema_start_epoch:
+                    # v3.5: Save whichever model is actually better, not always EMA
+                    if ema is not None and epoch >= cfg.ema_start_epoch and ema_val_mse <= val_mse_raw:
                         torch.save(_clean_state_dict(ema.state_dict()), snap_path)
+                        snap_mse_label = f"EMA MSE: {ema_val_mse:.6f}"
                     else:
                         torch.save(_clean_state_dict(model.state_dict()), snap_path)
+                        snap_mse_label = f"Model MSE: {val_mse_raw:.6f}"
                     last_snapshot_epoch = epoch
                     print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved at epoch {epoch} "
-                          f"(MSE: {current_snap_mse:.6f})")
+                          f"({snap_mse_label})")
                 else:
                     print(f"  -> Snapshot skipped at epoch {epoch} "
                           f"(MSE {current_snap_mse:.6f} > 1.5x best {best_val_mse:.6f})")

@@ -164,7 +164,7 @@ class NeuralForecastDataset(Dataset):
             Augmented (T, C, F)
         """
         X_fft = np.fft.rfft(x, axis=0)  # FFT along time axis
-        phase_noise = np.random.uniform(-0.05 * np.pi, 0.05 * np.pi, X_fft.shape)  # v3.4: reduced from 0.1
+        phase_noise = np.random.uniform(-0.1 * np.pi, 0.1 * np.pi, X_fft.shape)  # v3.5: restored from v3.3
         X_fft = X_fft * np.exp(1j * phase_noise)
         return np.fft.irfft(X_fft, n=x.shape[0], axis=0).astype(np.float32)
 
