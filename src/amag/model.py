@@ -4,6 +4,7 @@ from .modules.temporal_encoding import TemporalEncoder
 from .modules.spatial_interaction import SpatialInteraction
 from .modules.temporal_readout import TemporalReadout
 from .modules.revin import RevIN
+from .modules.dish_ts import DishTS
 from .modules.channel_attention import ChannelAttention
 
 
@@ -12,6 +13,7 @@ class AMAG(nn.Module):
 
     Architecture: TE (Transformer) -> SI (Add + Modulator + Adaptor) -> CA -> TR (Transformer) -> FC
     Optional: RevIN (Kim et al., ICLR 2022) for distribution shift handling.
+    Optional: Dish-TS (Fan et al., AAAI 2023) — learned distribution coefficients (replaces RevIN).
     Optional: Channel attention (iTransformer-style) for sample-dependent spatial mixing.
     Optional: Session embeddings for cross-day adaptation.
     """
@@ -25,6 +27,7 @@ class AMAG(nn.Module):
                  use_adaptor: bool = True,
                  adaptor_chunk_size: int = 8,
                  use_revin: bool = False,
+                 use_dish_ts: bool = False,
                  use_channel_attn: bool = False,
                  use_feature_pathways: bool = False,
                  use_session_embed: bool = False,
@@ -33,10 +36,13 @@ class AMAG(nn.Module):
         self.num_channels = num_channels
         self.hidden_dim = hidden_dim
         self.use_revin = use_revin
+        self.use_dish_ts = use_dish_ts
         self.use_channel_attn = use_channel_attn
         self.use_session_embed = use_session_embed
 
-        if use_revin:
+        if use_dish_ts:
+            self.dish_ts = DishTS(num_channels)
+        elif use_revin:
             self.revin = RevIN(num_channels)
 
         if use_session_embed:
@@ -77,6 +83,28 @@ class AMAG(nn.Module):
             dropout=dropout,
         )
 
+    def _apply_input_norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply input normalization (Dish-TS or RevIN) to LMP channel."""
+        if self.use_dish_ts:
+            lmp = x[:, :, :, 0]  # (B, T, C)
+            lmp_norm = self.dish_ts.normalize(lmp)
+            x = x.clone()
+            x[:, :, :, 0] = lmp_norm
+        elif self.use_revin:
+            lmp = x[:, :, :, 0]
+            lmp_norm = self.revin.normalize(lmp)
+            x = x.clone()
+            x[:, :, :, 0] = lmp_norm
+        return x
+
+    def _apply_output_denorm(self, pred: torch.Tensor) -> torch.Tensor:
+        """Apply output denormalization (Dish-TS or RevIN)."""
+        if self.use_dish_ts:
+            pred = self.dish_ts.denormalize(pred)
+        elif self.use_revin:
+            pred = self.revin.denormalize(pred)
+        return pred
+
     def forward(self, x: torch.Tensor, session_ids: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
@@ -85,11 +113,7 @@ class AMAG(nn.Module):
         Returns:
             pred: (B, T, C) LMP predictions for all timesteps
         """
-        if self.use_revin:
-            lmp = x[:, :, :, 0]  # (B, T, C)
-            lmp_norm = self.revin.normalize(lmp)
-            x = x.clone()
-            x[:, :, :, 0] = lmp_norm
+        x = self._apply_input_norm(x)
 
         h = self.te(x)    # (B, T, C, D)
 
@@ -104,18 +128,13 @@ class AMAG(nn.Module):
 
         pred = self.tr(z)  # (B, T, C)
 
-        if self.use_revin:
-            pred = self.revin.denormalize(pred)
+        pred = self._apply_output_denorm(pred)
 
         return pred
 
     def get_te_hidden(self, x: torch.Tensor, session_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Return TE hidden states for domain adaptation loss computation."""
-        if self.use_revin:
-            lmp = x[:, :, :, 0]
-            lmp_norm = self.revin.normalize(lmp)
-            x = x.clone()
-            x[:, :, :, 0] = lmp_norm
+        x = self._apply_input_norm(x)
         h = self.te(x)
         if self.use_session_embed and session_ids is not None:
             se = self.session_embed(session_ids)

@@ -10,6 +10,7 @@ from .data import prepare_datasets, denormalize_torch, compute_norm_stats
 from .adjacency import compute_correlation_matrix
 from .model import AMAG
 from .losses import compute_mmd_from_hidden, compute_coral_from_hidden, spectral_loss
+from .modules.dann import DomainClassifier, dann_alpha_schedule
 
 
 def _clean_state_dict(state_dict):
@@ -71,8 +72,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     phase_label = "Phase 1 (paper)" if cfg.optimizer_type == "adam" else "Phase 2 (compete)"
     print(f"Training {monkey_name} on {device}")
     print(f"{phase_label}: optimizer={cfg.optimizer_type}, scheduler={cfg.scheduler_type}, "
-          f"adaptor={cfg.use_adaptor}, revin={cfg.use_revin}, "
+          f"adaptor={cfg.use_adaptor}, revin={cfg.use_revin}, dish_ts={cfg.use_dish_ts}, "
           f"mmd={cfg.mmd_lambda}, coral={cfg.coral_lambda}, "
+          f"dann={cfg.use_dann}(λ={cfg.dann_lambda}), "
           f"consistency={cfg.use_consistency}(λ={cfg.consist_lambda}), "
           f"spectral={cfg.spectral_lambda}, "
           f"EMA={cfg.use_ema}, Mixup={cfg.use_mixup}, "
@@ -158,6 +160,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         use_adaptor=cfg.use_adaptor,
         adaptor_chunk_size=adaptor_chunk,
         use_revin=cfg.use_revin,
+        use_dish_ts=cfg.use_dish_ts,
         use_channel_attn=cfg.use_channel_attn,
         use_feature_pathways=cfg.use_feature_pathways,
         use_session_embed=cfg.use_session_embed,
@@ -167,15 +170,26 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     # Keep reference to raw module for sub-module access
     raw_model = model
 
+    # DANN: domain classifier for session-adversarial training
+    domain_classifier = None
+    use_dann = cfg.use_dann and cfg.dann_lambda > 0
+    if use_dann:
+        domain_classifier = DomainClassifier(cfg.hidden_dim, num_sessions).to(device)
+        print(f"DANN domain classifier: {sum(p.numel() for p in domain_classifier.parameters()):,} params")
+
     param_count = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     print(f"Model parameters: {param_count:,}")
 
-    # Optimizer selection
+    # Optimizer selection — include DANN classifier params if used
+    all_params = list(model.parameters())
+    if domain_classifier is not None:
+        all_params += list(domain_classifier.parameters())
+
     if cfg.optimizer_type == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr,
+        optimizer = torch.optim.Adam(all_params, lr=cfg.lr,
                                      weight_decay=cfg.weight_decay)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
+        optimizer = torch.optim.AdamW(all_params, lr=cfg.lr,
                                        weight_decay=cfg.weight_decay)
 
     # Scheduler selection
@@ -205,6 +219,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     use_coral = cfg.coral_lambda > 0
     use_consistency = cfg.use_consistency and cfg.consist_lambda > 0
     use_spectral = cfg.spectral_lambda > 0
+    # use_dann already set above
 
     best_val_mse = float("inf")
     best_ema_val_mse = float("inf")
@@ -229,9 +244,13 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         train_loss_sum = 0.0
         train_mmd_sum = 0.0
         train_coral_sum = 0.0
+        train_dann_sum = 0.0
         train_consist_sum = 0.0
         train_spec_sum = 0.0
         train_count = 0
+
+        # DANN alpha schedule: ramps from 0 to 1 over training
+        dann_alpha = dann_alpha_schedule(epoch, cfg.epochs) if use_dann else 0.0
 
         # Reset mixup iterator each epoch (reuses existing DataLoader)
         if cfg.use_mixup:
@@ -268,6 +287,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             pred = model(x, sess_ids_device)
             mmd_l = torch.tensor(0.0, device=device)
             coral_l = torch.tensor(0.0, device=device)
+            dann_l = torch.tensor(0.0, device=device)
             consist_l = torch.tensor(0.0, device=device)
 
             # MMD loss: compute from hidden states if enabled
@@ -279,6 +299,13 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if use_coral and session_ids is not None:
                 h = raw_model.get_te_hidden(x, sess_ids_device)
                 coral_l = compute_coral_from_hidden(h, sess_ids_device)
+
+            # DANN: domain-adversarial loss with gradient reversal
+            if use_dann and session_ids is not None and sess_ids_device is not None:
+                h = raw_model.get_te_hidden(x, sess_ids_device)
+                h_pooled = h.mean(dim=(1, 2))  # (B, D)
+                session_logits = domain_classifier(h_pooled, dann_alpha)
+                dann_l = nn.functional.cross_entropy(session_logits, sess_ids_device)
 
             # Consistency regularization: second forward with different augmentation noise
             if use_consistency:
@@ -299,6 +326,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
             loss = (mse_loss + cfg.mmd_lambda * mmd_l
                     + cfg.coral_lambda * coral_l
+                    + cfg.dann_lambda * dann_l
                     + cfg.consist_lambda * consist_l
                     + cfg.spectral_lambda * spec_l)
             # Scale for gradient accumulation
@@ -320,6 +348,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             train_loss_sum += mse_loss.item() * x.size(0)
             train_mmd_sum += mmd_l.item() * x.size(0)
             train_coral_sum += coral_l.item() * x.size(0)
+            train_dann_sum += dann_l.item() * x.size(0)
             train_consist_sum += consist_l.item() * x.size(0)
             train_spec_sum += spec_l.item() * x.size(0)
             train_count += x.size(0)
@@ -349,6 +378,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         train_mse = train_loss_sum / train_count
         train_mmd_avg = train_mmd_sum / train_count if use_mmd else 0
         train_coral_avg = train_coral_sum / train_count if use_coral else 0
+        train_dann_avg = train_dann_sum / train_count if use_dann else 0
         train_consist_avg = train_consist_sum / train_count if use_consistency else 0
         train_spec_avg = train_spec_sum / train_count if use_spectral else 0
 
@@ -377,6 +407,8 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 aux_str += f" | MMD: {train_mmd_avg:.6f}"
             if use_coral:
                 aux_str += f" | CORAL: {train_coral_avg:.6f}"
+            if use_dann:
+                aux_str += f" | DANN: {train_dann_avg:.4f}(α={dann_alpha:.2f})"
             if use_consistency:
                 aux_str += f" | Consist: {train_consist_avg:.6f}"
             if use_spectral:

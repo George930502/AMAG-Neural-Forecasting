@@ -59,6 +59,42 @@ class RevIN(nn.Module):
         return x * self._std + self._mean
 
 
+# ---- Dish-TS (Fan et al., AAAI 2023) — learned distribution coefficients ----
+class CONET(nn.Module):
+    def __init__(self, num_channels, hidden=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * num_channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_channels),
+        )
+
+    def forward(self, mean, std):
+        stats = torch.cat([mean, std], dim=-1)
+        return self.net(stats)
+
+
+class DishTS(nn.Module):
+    def __init__(self, num_channels, context_len=10):
+        super().__init__()
+        self.context_len = context_len
+        self.input_conet = CONET(num_channels)
+        self.output_conet = CONET(num_channels)
+        self._mean = None
+        self._std = None
+
+    def normalize(self, x):
+        ctx = x[:, :self.context_len]
+        self._mean = ctx.mean(dim=1)
+        self._std = (ctx.var(dim=1, unbiased=False) + 1e-5).sqrt()
+        input_coeff = self.input_conet(self._mean, self._std)
+        return (x - input_coeff.unsqueeze(1)) / (self._std.unsqueeze(1) + 1e-5)
+
+    def denormalize(self, x):
+        output_coeff = self.output_conet(self._mean, self._std)
+        return x * (self._std.unsqueeze(1) + 1e-5) + output_coeff.unsqueeze(1)
+
+
 # ---- Transformer Block (multi-head, pre-norm) ----
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, d_ff=256, num_heads=1, dropout=0.0):
@@ -253,15 +289,19 @@ class AMAG(nn.Module):
     def __init__(self, num_channels, num_features=9, hidden_dim=128, d_ff=512,
                  num_heads=4, num_layers=2, total_len=20,
                  use_adaptor=False, adaptor_chunk_size=8,
-                 use_revin=False, use_channel_attn=True,
+                 use_revin=False, use_dish_ts=False,
+                 use_channel_attn=True,
                  use_feature_pathways=True,
                  use_session_embed=False, num_sessions=3,
                  dropout=0.0):
         super().__init__()
         self.use_revin = use_revin
+        self.use_dish_ts = use_dish_ts
         self.use_channel_attn = use_channel_attn
         self.use_session_embed = use_session_embed
-        if use_revin:
+        if use_dish_ts:
+            self.dish_ts = DishTS(num_channels)
+        elif use_revin:
             self.revin = RevIN(num_channels)
         if use_session_embed:
             self.session_embed = nn.Embedding(num_sessions, hidden_dim)
@@ -275,7 +315,12 @@ class AMAG(nn.Module):
         self.tr = TemporalReadout(hidden_dim, d_ff, num_heads, num_layers, dropout)
 
     def forward(self, x, session_ids=None):
-        if self.use_revin:
+        if self.use_dish_ts:
+            lmp = x[:, :, :, 0]
+            lmp_norm = self.dish_ts.normalize(lmp)
+            x = x.clone()
+            x[:, :, :, 0] = lmp_norm
+        elif self.use_revin:
             lmp = x[:, :, :, 0]
             lmp_norm = self.revin.normalize(lmp)
             x = x.clone()
@@ -288,7 +333,9 @@ class AMAG(nn.Module):
         if self.use_channel_attn:
             z = self.channel_attn(z)
         pred = self.tr(z)
-        if self.use_revin:
+        if self.use_dish_ts:
+            pred = self.dish_ts.denormalize(pred)
+        elif self.use_revin:
             pred = self.revin.denormalize(pred)
         return pred
 
@@ -347,6 +394,7 @@ class Model:
         state_dict = self._clean_state_dict(state_dict)
         config = {
             "use_revin": any(k.startswith("revin.") for k in state_dict),
+            "use_dish_ts": any(k.startswith("dish_ts.") for k in state_dict),
             "use_channel_attn": any(k.startswith("channel_attn.") for k in state_dict),
             "use_session_embed": any(k.startswith("session_embed.") for k in state_dict),
             "use_feature_pathways": "te.embed_lmp.weight" in state_dict,
@@ -403,6 +451,7 @@ class Model:
             use_adaptor=False,
             adaptor_chunk_size=chunk,
             use_revin=config.get("use_revin", False),
+            use_dish_ts=config.get("use_dish_ts", False),
             use_channel_attn=config.get("use_channel_attn", False),
             use_feature_pathways=config.get("use_feature_pathways", False),
             use_session_embed=config.get("use_session_embed", False),

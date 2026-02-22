@@ -98,11 +98,18 @@ class TrainConfig:
     # OOD: RevIN (Kim et al., ICLR 2022)
     use_revin: bool = False
 
+    # OOD: Dish-TS (Fan et al., AAAI 2023) — replaces RevIN
+    use_dish_ts: bool = False
+
     # OOD: MMD loss (Gretton et al., JMLR 2012)
     mmd_lambda: float = 0.0
 
     # OOD: CORAL loss (Sun & Saenko, ECCV 2016)
     coral_lambda: float = 0.0
+
+    # OOD: DANN (Ganin et al., JMLR 2016) — domain-adversarial training
+    use_dann: bool = False
+    dann_lambda: float = 0.0
 
     # Consistency regularization (Laine & Aila, ICLR 2017)
     use_consistency: bool = False
@@ -165,38 +172,40 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4: d=96 model + RevIN + CORAL + consistency.
+    """Competition config v4: d=64 + Dish-TS + DANN.
 
-    v4: Increased capacity (d=96, ~200K params) with stronger regularization
-    stack (dropout=0.15, wd=1e-4, CORAL, consistency, RevIN). Multi-seed
-    ensemble (3 seeds x 5 models = 15 models per monkey) for robust predictions.
+    v4 redesign: Reverted to d=64 (paper-faithful size, ~106K params) with
+    Dish-TS (Fan et al., AAAI 2023) replacing RevIN for stable learned
+    distribution coefficients, and DANN (Ganin et al., JMLR 2016) replacing
+    CORAL for adversarial session-invariant feature learning. Multi-seed
+    ensemble (3 seeds x 5 models = 15 models per monkey).
     """
     return TrainConfig(
-        # Model: increased capacity (d=96, 1 layer, 1 head, ~200K params)
-        hidden_dim=96,
-        d_ff=384,
+        # Model: paper-faithful d=64 (prevents overfitting on 630-1049 samples)
+        hidden_dim=64,
+        d_ff=256,
         num_heads=1,
         num_layers=1,
-        dropout=0.15,
+        dropout=0.1,
         use_adaptor=False,
         use_channel_attn=False,
         use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (4 cycles of 60 epochs)
+        weight_decay=5e-5,
+        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 60 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=250,
+        epochs=200,
         val_every=5,
-        patience=40,
-        warmup_epochs=10,
+        patience=30,
+        warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
-        ema_start_epoch=20,
-        # Snapshot ensemble — 4 snapshots from 60-epoch cycles
-        num_snapshots=4,
+        ema_start_epoch=15,
+        # Snapshot ensemble — 3 snapshots from 60-epoch cycles
+        num_snapshots=3,
         snapshot_cycle_len=60,
         # Augmentation
         aug_jitter_std=0.02,
@@ -205,14 +214,16 @@ def phase2_config() -> TrainConfig:
         # Mixup (Zhang et al., ICLR 2018)
         use_mixup=True,
         mixup_alpha=0.2,
-        # RevIN (Kim et al., ICLR 2022) — context-only stats
-        use_revin=True,
-        # CORAL (Sun & Saenko, ECCV 2016) — session-invariant features
-        coral_lambda=0.1,
-        # Consistency regularization (Laine & Aila, ICLR 2017)
-        use_consistency=True,
-        consist_lambda=0.5,
-        # MMD disabled — replaced by CORAL
+        # Dish-TS (Fan et al., AAAI 2023) — learned distribution coefficients
+        use_revin=False,
+        use_dish_ts=True,
+        # DANN (Ganin et al., JMLR 2016) — domain-adversarial training
+        use_dann=True,
+        dann_lambda=0.1,
+        # CORAL/consistency/MMD disabled — replaced by DANN
+        coral_lambda=0.0,
+        use_consistency=False,
+        consist_lambda=0.0,
         mmd_lambda=0.0,
         # Spectral loss disabled
         spectral_lambda=0.0,
