@@ -1,11 +1,11 @@
 """Codabench-compatible submission model.
 
 Self-contained AMAG model definition + inference with training normalization stats.
-v3.2: Paper architecture (d=64, 1 layer, 1 head), best model included in ensemble.
+v3.4: Mtime-filtered snapshots, weighted ensemble (2x for best), TTA (5 passes).
 
 Expected files alongside this script:
-  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap5.pth (quality-gated snapshots)
-  - amag_{monkey}_best.pth (always included in ensemble)
+  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap3.pth (quality-gated, mtime-filtered)
+  - amag_{monkey}_best.pth, amag_{monkey}_ema_best.pth (always included in ensemble)
   - norm_stats_{monkey}.npz (training normalization stats)
 """
 
@@ -329,6 +329,7 @@ class Model:
             raise ValueError(f"Unknown monkey: {monkey_name}")
 
         self.models = []
+        self._all_paths = []  # Paths of loaded checkpoints (for weighted ensemble)
         self.model_config = {}
         self.norm_stats = None  # Per-session normalization stats from training
 
@@ -443,12 +444,24 @@ class Model:
         elif os.path.exists(ema_best_path):
             config_sd = torch.load(ema_best_path, map_location=device, weights_only=True)
 
-        # Try loading up to 5 snapshot checkpoints for ensemble
+        # Try loading snapshot checkpoints for ensemble
         snapshot_paths = [
             os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
-            for i in range(1, 6)
+            for i in range(1, 10)  # Search up to 9
         ]
         snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
+
+        # Filter snapshots by recency: only keep those from the same training run
+        # as the best model (within 2 hours mtime difference)
+        ref_path = best_path if os.path.exists(best_path) else (
+            ema_best_path if os.path.exists(ema_best_path) else None)
+        if ref_path and snapshots_found:
+            ref_mtime = os.path.getmtime(ref_path)
+            snapshots_found = [
+                p for p in snapshots_found
+                if abs(os.path.getmtime(p) - ref_mtime) < 7200  # 2 hours
+            ]
+        snapshots_found = snapshots_found[:3]  # Cap at 3 snapshots
 
         # Collect all unique checkpoint paths: best + snapshots
         all_paths = []
@@ -460,6 +473,8 @@ class Model:
 
         if not all_paths:
             raise FileNotFoundError(f"No checkpoints found for {self.monkey_name}")
+
+        self._all_paths = all_paths
 
         # Detect config from first available checkpoint
         if config_sd is None:
@@ -530,21 +545,45 @@ class Model:
         # Mask future (same as training)
         x_norm[:, context_len:] = x_norm[:, context_len - 1: context_len]
 
-        # Run inference: average predictions from all snapshot models
+        # Weighted ensemble: best/ema_best get 2x weight vs snapshots
+        weights = []
+        for p in self._all_paths:
+            bname = os.path.basename(p)
+            weights.append(2.0 if "best" in bname else 1.0)
+        total_w = sum(weights)
+        weights = [w / total_w for w in weights]
+
+        # Test-time augmentation: 1 clean + 4 jittered forward passes per model
+        n_tta = 5
         batch_size = 8 if self.num_channels > 200 else 16
-        all_preds = []
 
-        for model in self.models:
-            predictions = []
-            with torch.no_grad():
-                for i in range(0, n, batch_size):
-                    batch = torch.from_numpy(x_norm[i:i + batch_size]).to(device)
-                    pred_norm = model(batch)  # (B, T, C)
-                    predictions.append(pred_norm.cpu().numpy())
-            all_preds.append(np.concatenate(predictions, axis=0))
+        weighted_sum = np.zeros((n, t, c), dtype=np.float64)
 
-        # Average across snapshots
-        pred_norm_all = np.mean(all_preds, axis=0)  # (N, T, C)
+        for model_idx, model in enumerate(self.models):
+            model_preds = []
+            for tta_i in range(n_tta):
+                x_aug = x_norm.copy()
+                if tta_i > 0:
+                    # Add small noise to context window only
+                    noise = np.random.randn(
+                        n, context_len, c, f
+                    ).astype(np.float32) * 0.005
+                    x_aug[:, :context_len] = x_aug[:, :context_len] + noise
+
+                predictions = []
+                with torch.no_grad():
+                    for i in range(0, n, batch_size):
+                        batch = torch.from_numpy(
+                            x_aug[i:i + batch_size]).to(device)
+                        pred_norm = model(batch)  # (B, T, C)
+                        predictions.append(pred_norm.cpu().numpy())
+                model_preds.append(np.concatenate(predictions, axis=0))
+
+            # Average TTA passes for this model, then apply weight
+            model_avg = np.mean(model_preds, axis=0)
+            weighted_sum += weights[model_idx] * model_avg
+
+        pred_norm_all = weighted_sum.astype(np.float32)
 
         # Denormalize with same stats used for normalization
         pred_raw = denormalize_lmp(pred_norm_all, mean, std, f)

@@ -107,6 +107,12 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     # so the submission model can use identical normalization
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Delete stale snapshot files from previous runs to prevent ensemble poisoning
+    for old_snap in ckpt_dir.glob(f"amag_{monkey_name}_snap*.pth"):
+        old_snap.unlink()
+        print(f"Removed stale checkpoint: {old_snap}")
+
     norm_stats_path = ckpt_dir / f"norm_stats_{monkey_name}.npz"
     stats_dict = {}
     for i, (m, s) in enumerate(per_session_stats):

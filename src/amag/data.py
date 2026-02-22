@@ -164,7 +164,7 @@ class NeuralForecastDataset(Dataset):
             Augmented (T, C, F)
         """
         X_fft = np.fft.rfft(x, axis=0)  # FFT along time axis
-        phase_noise = np.random.uniform(-0.1 * np.pi, 0.1 * np.pi, X_fft.shape)
+        phase_noise = np.random.uniform(-0.05 * np.pi, 0.05 * np.pi, X_fft.shape)  # v3.4: reduced from 0.1
         X_fft = X_fft * np.exp(1j * phase_noise)
         return np.fft.irfft(X_fft, n=x.shape[0], axis=0).astype(np.float32)
 
@@ -212,7 +212,9 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
         all_norm.append(norm)
         all_raw_lmp.append(session_data[:, :, :, 0])
 
-    # Hold out val_split from EACH session for a mixed validation set
+    # Hold out val_split from session 0 (same-day) only.
+    # Cross-date sessions go 100% into training — their val samples would get
+    # wrong denormalization (session 0 stats) and corrupt model selection.
     rng = np.random.RandomState(seed)
 
     train_norm_parts = []
@@ -224,16 +226,18 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
     for i, (norm, raw_lmp) in enumerate(zip(all_norm, all_raw_lmp)):
         n = len(norm)
         indices = rng.permutation(n)
-        n_val = max(1, int(n * val_split))
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:]
+        if i == 0:  # Same-day: hold out val
+            n_val = max(1, int(n * val_split))
+            val_idx = indices[:n_val]
+            train_idx = indices[n_val:]
+            val_norm_parts.append(norm[val_idx])
+            val_raw_parts.append(raw_lmp[val_idx])
+        else:  # Cross-date: 100% training
+            train_idx = indices
 
         train_norm_parts.append(norm[train_idx])
         train_raw_parts.append(raw_lmp[train_idx])
         train_session_parts.append(np.full(len(train_idx), i, dtype=np.int64))
-
-        val_norm_parts.append(norm[val_idx])
-        val_raw_parts.append(raw_lmp[val_idx])
 
     train_norm = np.concatenate(train_norm_parts, axis=0)
     train_raw = np.concatenate(train_raw_parts, axis=0)

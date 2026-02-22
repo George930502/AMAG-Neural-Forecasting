@@ -33,8 +33,16 @@ def score_mse(prediction: np.ndarray, solution: np.ndarray) -> float:
 
 
 def evaluate_all(checkpoint_dir: str = "checkpoints",
-                 dataset_dir: str = "dataset"):
-    """Evaluate using the submission Model on all train files."""
+                 dataset_dir: str = "dataset",
+                 val_only: bool = False,
+                 val_split: float = 0.1,
+                 seed: int = 42):
+    """Evaluate using the submission Model on train files.
+
+    Args:
+        val_only: If True, evaluate only on the held-out validation split
+                  (same-day session 0 only), giving honest local metrics.
+    """
 
     # Copy checkpoints to submission/ so the Model class finds them
     ckpt_path = Path(checkpoint_dir)
@@ -65,19 +73,37 @@ def evaluate_all(checkpoint_dir: str = "checkpoints",
                 "train_data_affi_2024-03-20_private.npz",
             ]
 
-        for fname in train_files:
+        for fidx, fname in enumerate(train_files):
             fpath = Path(dataset_dir) / "train" / fname
             if not fpath.exists():
                 print(f"  {fname}: NOT FOUND")
                 continue
 
             data = np.load(str(fpath))["arr_0"]  # (N, 20, C, 9)
+
+            if val_only:
+                # Only evaluate on held-out val split from session 0 (same-day)
+                if fidx != 0:
+                    print(f"  {fname}: SKIPPED (val_only mode, cross-date)")
+                    continue
+                rng = np.random.RandomState(seed)
+                n = len(data)
+                indices = rng.permutation(n)
+                n_val = max(1, int(n * val_split))
+                val_indices = indices[:n_val]
+                data = data[val_indices]
+                print(f"  {fname} (val split: {len(data)} samples)")
+            else:
+                label = "same-day" if "private" not in fname else "cross-date"
+                print(f"  {fname}")
+
             pred = model.predict(data)  # (N, 20, C)
             mse = score_mse(pred, data)
 
-            label = "same-day" if "private" not in fname else "cross-date"
-            print(f"  {fname}")
-            print(f"    [{label}] MSE (steps 10-19): {mse:.2f}")
+            if val_only:
+                print(f"    [val-only] MSE (steps 10-19): {mse:.2f}")
+            else:
+                print(f"    [{label}] MSE (steps 10-19): {mse:.2f}")
 
 
 def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
@@ -95,4 +121,5 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
 
 
 if __name__ == "__main__":
-    evaluate_all()
+    val_only = "--val-only" in sys.argv
+    evaluate_all(val_only=val_only)
