@@ -332,8 +332,18 @@ class Model:
         self.model_config = {}
         self.norm_stats = None  # Per-session normalization stats from training
 
+    @staticmethod
+    def _clean_state_dict(state_dict):
+        """Strip '_orig_mod.' prefix added by torch.compile."""
+        cleaned = {}
+        for k, v in state_dict.items():
+            cleaned[k.removeprefix("_orig_mod.")] = v
+        return cleaned
+
     def _detect_config(self, state_dict):
         """Detect model configuration from checkpoint state dict."""
+        # Strip torch.compile prefix if present
+        state_dict = self._clean_state_dict(state_dict)
         config = {
             "use_revin": any(k.startswith("revin.") for k in state_dict),
             "use_channel_attn": any(k.startswith("channel_attn.") for k in state_dict),
@@ -438,7 +448,8 @@ class Model:
             for path in snapshots_found:
                 m = self._make_model(self.model_config)
                 state_dict = torch.load(path, map_location=device, weights_only=True)
-                m.load_state_dict(state_dict)
+                state_dict = self._clean_state_dict(state_dict)
+                m.load_state_dict(state_dict, strict=False)
                 m.to(device)
                 m.eval()
                 self.models.append(m)
@@ -447,10 +458,11 @@ class Model:
             # Fallback: single best checkpoint
             weight_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
             state_dict = torch.load(weight_path, map_location=device, weights_only=True)
+            state_dict = self._clean_state_dict(state_dict)
             self.model_config = self._detect_config(state_dict)
 
             m = self._make_model(self.model_config)
-            m.load_state_dict(state_dict)
+            m.load_state_dict(state_dict, strict=False)
             m.to(device)
             m.eval()
             self.models.append(m)
