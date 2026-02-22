@@ -95,6 +95,6 @@ def spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar spectral loss
     """
-    pred_fft = torch.fft.rfft(pred, dim=1)
-    target_fft = torch.fft.rfft(target, dim=1)
+    pred_fft = torch.fft.rfft(pred.float(), dim=1)
+    target_fft = torch.fft.rfft(target.float(), dim=1)
     return F.mse_loss(pred_fft.abs(), target_fft.abs())
