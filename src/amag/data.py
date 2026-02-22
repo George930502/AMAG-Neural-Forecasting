@@ -187,15 +187,23 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
                      jitter_std: float = 0.02,
                      scale_std: float = 0.1,
                      channel_drop_p: float = 0.1,
-                     freq_augment: bool = False):
+                     freq_augment: bool = False,
+                     ood_validation: bool = False):
     """Load and prepare train/val datasets with per-session normalization.
 
     Each session is normalized independently using its own statistics.
     This ensures all sessions map to a consistent [-1, 1] range regardless
     of their raw signal scale.
 
+    Args:
+        ood_validation: If True, hold out ALL cross-date sessions as OOD
+            validation instead of training on them. Train on same-day only.
+            Returns 4-tuple: (train_ds, val_ds, ood_val_ds, per_session_stats).
+            If False (default), train on all sessions, return 3-tuple.
+
     Returns:
-        train_dataset, val_dataset, per_session_stats
+        If ood_validation=False: train_dataset, val_dataset, per_session_stats
+        If ood_validation=True: train_dataset, val_dataset, ood_val_dataset, per_session_stats
     """
     all_data = load_all_train_data(dataset_dir, train_files)
 
@@ -221,19 +229,37 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
     val_idx = indices[:n_val]
     train_idx = indices[n_val:]
 
-    # Training: primary train split + all cross-day sessions
-    train_norm_parts = [primary_norm[train_idx]]
-    train_raw_parts = [primary_raw[train_idx]]
-    train_session_parts = [np.zeros(len(train_idx), dtype=np.int64)]  # session 0
+    if ood_validation and len(all_norm) > 1:
+        # OOD validation mode: train on same-day only, cross-date → OOD val
+        train_norm = primary_norm[train_idx]
+        train_raw = primary_raw[train_idx]
+        train_sessions = np.zeros(len(train_idx), dtype=np.int64)
 
-    for i in range(1, len(all_norm)):
-        train_norm_parts.append(all_norm[i])
-        train_raw_parts.append(all_raw_lmp[i])
-        train_session_parts.append(np.full(len(all_norm[i]), i, dtype=np.int64))
+        # Cross-date sessions become OOD validation
+        # Denormalize cross-date using primary session stats for raw MSE eval
+        ood_norm_parts = []
+        ood_raw_parts = []
+        for i in range(1, len(all_norm)):
+            ood_norm_parts.append(all_norm[i])
+            ood_raw_parts.append(all_raw_lmp[i])
 
-    train_norm = np.concatenate(train_norm_parts, axis=0)
-    train_raw = np.concatenate(train_raw_parts, axis=0)
-    train_sessions = np.concatenate(train_session_parts, axis=0)
+        ood_norm = np.concatenate(ood_norm_parts, axis=0)
+        ood_raw = np.concatenate(ood_raw_parts, axis=0)
+    else:
+        # Original mode: train on all sessions
+        train_norm_parts = [primary_norm[train_idx]]
+        train_raw_parts = [primary_raw[train_idx]]
+        train_session_parts = [np.zeros(len(train_idx), dtype=np.int64)]
+
+        for i in range(1, len(all_norm)):
+            train_norm_parts.append(all_norm[i])
+            train_raw_parts.append(all_raw_lmp[i])
+            train_session_parts.append(np.full(len(all_norm[i]), i, dtype=np.int64))
+
+        train_norm = np.concatenate(train_norm_parts, axis=0)
+        train_raw = np.concatenate(train_raw_parts, axis=0)
+        train_sessions = np.concatenate(train_session_parts, axis=0)
+
     val_norm = primary_norm[val_idx]
     val_raw = primary_raw[val_idx]
 
@@ -248,5 +274,8 @@ def prepare_datasets(dataset_dir: str, train_files: list[str],
     )
     val_ds = NeuralForecastDataset(val_norm, val_raw, context_len)
 
-    # Return primary session stats for backward compat (val evaluation)
+    if ood_validation and len(all_norm) > 1:
+        ood_val_ds = NeuralForecastDataset(ood_norm, ood_raw, context_len)
+        return train_ds, val_ds, ood_val_ds, per_session_stats
+
     return train_ds, val_ds, per_session_stats

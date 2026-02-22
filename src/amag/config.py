@@ -158,48 +158,53 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config with OOD extensions for cross-date generalization."""
+    """Competition config: paper-sized model (d=64) + OOD extensions.
+
+    v3.2: Reverted from d=128/2-layer/4-head (925K params, overfitting) back to
+    paper architecture (d=64/1-layer/1-head, ~106K params). Kept good v3.1
+    additions (norm stats pipeline, augmentation, EMA, cosine scheduler).
+    """
     return TrainConfig(
-        # Model: deeper multi-head transformer, larger hidden dim
-        hidden_dim=128,
-        d_ff=512,
-        num_heads=4,
-        num_layers=2,
-        dropout=0.15,
+        # Model: paper architecture (d=64, 1 layer, 1 head)
+        hidden_dim=64,
+        d_ff=256,
+        num_heads=1,
+        num_layers=1,
+        dropout=0.05,
         use_adaptor=False,
-        use_channel_attn=True,
-        use_feature_pathways=True,
+        use_channel_attn=False,
+        use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=1e-3,
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 100 epochs)
+        weight_decay=1e-5,  # Paper value (was 1e-3 — too aggressive)
+        # Scheduler: CosineAnnealingWarmRestarts (5 cycles of 80 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=300,
+        epochs=400,
         val_every=5,
-        patience=60,
-        warmup_epochs=10,
+        patience=80,  # Longer patience — cosine restarts cause temporary val MSE spikes
+        warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=20,
-        # Snapshot ensemble — only 3 snapshots from 100-epoch cycles
-        num_snapshots=3,
-        snapshot_cycle_len=100,
+        # Snapshot ensemble — 5 snapshots from 80-epoch cycles
+        num_snapshots=5,
+        snapshot_cycle_len=80,
         # Augmentation
         aug_jitter_std=0.02,
         aug_scale_std=0.1,
         aug_channel_drop_p=0.1,
-        # Mixup (Zhang et al., ICLR 2018)
+        # Mixup (Zhang et al., ICLR 2018) — reduced alpha
         use_mixup=True,
-        mixup_alpha=0.3,
+        mixup_alpha=0.2,
         # RevIN disabled — causes double normalization with TTA
         use_revin=False,
         # MMD disabled — session embeddings have train/eval mismatch
         mmd_lambda=0.0,
-        # Spectral loss — reduced weight
-        spectral_lambda=0.05,
-        # MSE loss (Huber was competing with spectral loss)
+        # Spectral loss disabled — competes with MSE at small model size
+        spectral_lambda=0.0,
+        # MSE loss
         loss_type="mse",
         # Session embeddings disabled — train/eval mismatch
         use_session_embed=False,

@@ -1,11 +1,11 @@
 """Codabench-compatible submission model.
 
 Self-contained AMAG model definition + inference with training normalization stats.
-v3.1: Fixed normalization pipeline, no RevIN/session embeddings, quality snapshots.
+v3.2: Paper architecture (d=64, 1 layer, 1 head), best model included in ensemble.
 
 Expected files alongside this script:
-  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap3.pth
-  - amag_{monkey}_best.pth (fallback)
+  - amag_{monkey}_snap1.pth .. amag_{monkey}_snap5.pth (quality-gated snapshots)
+  - amag_{monkey}_best.pth (always included in ensemble)
   - norm_stats_{monkey}.npz (training normalization stats)
 """
 
@@ -394,16 +394,16 @@ class Model:
         return AMAG(
             num_channels=self.num_channels,
             num_features=9,
-            hidden_dim=config.get("hidden_dim", 128),
-            d_ff=config.get("d_ff", 512),
-            num_heads=config.get("num_heads", 4),
-            num_layers=config.get("num_layers", 2),
+            hidden_dim=config.get("hidden_dim", 64),
+            d_ff=config.get("d_ff", 256),
+            num_heads=config.get("num_heads", 1),
+            num_layers=config.get("num_layers", 1),
             total_len=20,
             use_adaptor=False,
             adaptor_chunk_size=chunk,
             use_revin=config.get("use_revin", False),
-            use_channel_attn=config.get("use_channel_attn", True),
-            use_feature_pathways=config.get("use_feature_pathways", True),
+            use_channel_attn=config.get("use_channel_attn", False),
+            use_feature_pathways=config.get("use_feature_pathways", False),
             use_session_embed=config.get("use_session_embed", False),
             num_sessions=config.get("num_sessions", 3),
             dropout=0.0,  # No dropout at inference
@@ -432,41 +432,50 @@ class Model:
         # Load normalization stats from training
         self._load_norm_stats()
 
+        # Always try to load best model first (for config detection)
+        best_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
+        ema_best_path = os.path.join(base, f"amag_{self.monkey_name}_ema_best.pth")
+
+        # Detect config from best model or first available checkpoint
+        config_sd = None
+        if os.path.exists(best_path):
+            config_sd = torch.load(best_path, map_location=device, weights_only=True)
+        elif os.path.exists(ema_best_path):
+            config_sd = torch.load(ema_best_path, map_location=device, weights_only=True)
+
         # Try loading up to 5 snapshot checkpoints for ensemble
         snapshot_paths = [
             os.path.join(base, f"amag_{self.monkey_name}_snap{i}.pth")
             for i in range(1, 6)
         ]
-
         snapshots_found = [p for p in snapshot_paths if os.path.exists(p)]
 
-        if len(snapshots_found) >= 2:
-            # Detect config from first snapshot
-            first_sd = torch.load(snapshots_found[0], map_location=device, weights_only=True)
-            self.model_config = self._detect_config(first_sd)
+        # Collect all unique checkpoint paths: best + snapshots
+        all_paths = []
+        if os.path.exists(best_path):
+            all_paths.append(best_path)
+        if os.path.exists(ema_best_path):
+            all_paths.append(ema_best_path)
+        all_paths.extend(snapshots_found)
 
-            for path in snapshots_found:
-                m = self._make_model(self.model_config)
-                state_dict = torch.load(path, map_location=device, weights_only=True)
-                state_dict = self._clean_state_dict(state_dict)
-                m.load_state_dict(state_dict, strict=False)
-                m.to(device)
-                m.eval()
-                self.models.append(m)
-            print(f"Loaded {len(self.models)} snapshot models (config={self.model_config})")
-        else:
-            # Fallback: single best checkpoint
-            weight_path = os.path.join(base, f"amag_{self.monkey_name}_best.pth")
-            state_dict = torch.load(weight_path, map_location=device, weights_only=True)
-            state_dict = self._clean_state_dict(state_dict)
-            self.model_config = self._detect_config(state_dict)
+        if not all_paths:
+            raise FileNotFoundError(f"No checkpoints found for {self.monkey_name}")
 
+        # Detect config from first available checkpoint
+        if config_sd is None:
+            config_sd = torch.load(all_paths[0], map_location=device, weights_only=True)
+        self.model_config = self._detect_config(config_sd)
+
+        for path in all_paths:
             m = self._make_model(self.model_config)
+            state_dict = torch.load(path, map_location=device, weights_only=True)
+            state_dict = self._clean_state_dict(state_dict)
             m.load_state_dict(state_dict, strict=False)
             m.to(device)
             m.eval()
             self.models.append(m)
-            print(f"Loaded single best model (config={self.model_config})")
+
+        print(f"Loaded {len(self.models)} models (best + snapshots, config={self.model_config})")
 
     def _find_best_session_stats(self, x):
         """Find the best matching session stats for this data.

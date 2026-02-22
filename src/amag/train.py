@@ -88,8 +88,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     monkey_cfg = MONKEY_CONFIGS[monkey_name]
     C = monkey_cfg.num_channels
 
+    # Use OOD validation for phase2 (cross-date sessions as val)
+    use_ood = cfg.scheduler_type == "cosine" and len(monkey_cfg.train_files) > 1
+
     # Prepare data (per-session normalization + augmentation)
-    train_ds, val_ds, per_session_stats = prepare_datasets(
+    data_result = prepare_datasets(
         dataset_dir=cfg.dataset_dir,
         train_files=monkey_cfg.train_files,
         context_len=cfg.context_len,
@@ -100,8 +103,17 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         scale_std=cfg.aug_scale_std,
         channel_drop_p=cfg.aug_channel_drop_p,
         freq_augment=True,  # Enable frequency augmentation for compete mode
+        ood_validation=use_ood,
     )
-    print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
+
+    if use_ood:
+        train_ds, val_ds, ood_val_ds, per_session_stats = data_result
+        print(f"Train: {len(train_ds)} samples (same-day only), "
+              f"Val: {len(val_ds)} samples, OOD Val: {len(ood_val_ds)} samples")
+    else:
+        train_ds, val_ds, per_session_stats = data_result
+        ood_val_ds = None
+        print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
 
     # Val uses primary session stats for denormalization
     val_mean, val_std = per_session_stats[0]
@@ -130,6 +142,13 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=2, pin_memory=True,
                             persistent_workers=True)
+
+    # OOD validation loader (cross-date sessions)
+    ood_val_loader = None
+    if ood_val_ds is not None:
+        ood_val_loader = DataLoader(ood_val_ds, batch_size=cfg.batch_size, shuffle=False,
+                                    num_workers=2, pin_memory=True,
+                                    persistent_workers=True)
 
     # Compute correlation matrix from normalized training data
     corr = compute_correlation_matrix(train_ds.data_norm)
@@ -212,12 +231,12 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
     best_val_mse = float("inf")
     best_ema_val_mse = float("inf")
+    best_ood_val_mse = float("inf")
     patience_counter = 0
 
     # Snapshot tracking — with validation MSE for quality-gated saving
     snapshots_saved = 0
     last_snapshot_epoch = -1
-    snapshot_val_mses = []  # Track val MSE at each snapshot epoch
 
     # Persistent mixup DataLoader (reused across epochs, not recreated)
     mixup_loader = None
@@ -318,6 +337,14 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 ema.update(model)
 
+        # --- Fix 2: Reinitialize EMA shadow at ema_start_epoch ---
+        # Without this, EMA shadow starts from random init weights and takes
+        # 100+ epochs to forget them even with decay=0.999
+        if ema is not None and epoch == cfg.ema_start_epoch:
+            ema.shadow.load_state_dict(
+                {k: v.clone() for k, v in raw_model.state_dict().items()})
+            print(f"  -> EMA shadow reinitialized from trained model at epoch {epoch}")
+
         # Scheduler step
         if cfg.warmup_epochs > 0 and epoch <= cfg.warmup_epochs:
             warmup_scheduler.step()
@@ -328,20 +355,6 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
         train_mmd_avg = train_mmd_sum / train_count if use_mmd else 0
         train_spec_avg = train_spec_sum / train_count if use_spectral else 0
 
-        # --- Snapshot saving at cosine cycle minima ---
-        if (cfg.scheduler_type == "cosine"
-                and epoch % cfg.snapshot_cycle_len == 0
-                and snapshots_saved < cfg.num_snapshots
-                and epoch != last_snapshot_epoch):
-            snapshots_saved += 1
-            snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
-            if ema is not None and epoch >= cfg.ema_start_epoch:
-                torch.save(_clean_state_dict(ema.state_dict()), snap_path)
-            else:
-                torch.save(_clean_state_dict(model.state_dict()), snap_path)
-            last_snapshot_epoch = epoch
-            print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved at epoch {epoch}")
-
         # --- Validate ---
         if epoch % cfg.val_every == 0 or epoch == 1:
             model.eval()
@@ -351,6 +364,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
 
             # Also evaluate EMA model
             ema_mse_str = ""
+            ema_val_mse = float("inf")
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 ema_val_mse = evaluate_raw_mse(
                     ema.shadow, val_loader, val_mean_t, val_std_t, cfg, device,
@@ -362,6 +376,17 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     save_path = ckpt_dir / f"amag_{monkey_name}_ema_best.pth"
                     torch.save(_clean_state_dict(ema.state_dict()), save_path)
 
+            # OOD validation (cross-date sessions)
+            ood_mse_str = ""
+            ood_val_mse = float("inf")
+            if ood_val_loader is not None:
+                # Evaluate OOD using primary session stats (same as same-day val)
+                ood_val_mse = evaluate_raw_mse(
+                    ema.shadow if (ema is not None and epoch >= cfg.ema_start_epoch) else model,
+                    ood_val_loader, val_mean_t, val_std_t, cfg, device,
+                    use_amp=use_amp, amp_dtype=amp_dtype)
+                ood_mse_str = f" | OOD MSE: {ood_val_mse:.6f}"
+
             lr = optimizer.param_groups[0]["lr"]
             aux_str = ""
             if use_mmd:
@@ -369,12 +394,16 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             if use_spectral:
                 aux_str += f" | Spec: {train_spec_avg:.6f}"
             print(f"Epoch {epoch:4d} | Train MSE(norm): {train_mse:.6f}{aux_str} | "
-                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str} | LR: {lr:.6f}")
+                  f"Val MSE(raw): {val_mse_raw:.6f}{ema_mse_str}{ood_mse_str} | LR: {lr:.6f}")
 
-            # Track best using whichever is better (EMA or regular)
+            # Track best: use OOD val if available (3/5 test sets are cross-date),
+            # otherwise fall back to same-day val
             effective_mse = val_mse_raw
             if ema is not None and epoch >= cfg.ema_start_epoch:
                 effective_mse = min(val_mse_raw, ema_val_mse)
+
+            # For early stopping, prefer OOD MSE when available
+            stopping_mse = ood_val_mse if ood_val_loader is not None else effective_mse
 
             if effective_mse < best_val_mse:
                 best_val_mse = effective_mse
@@ -386,11 +415,40 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 else:
                     torch.save(_clean_state_dict(model.state_dict()), save_path)
                     print(f"  -> New best! Saved to {save_path}")
+            elif ood_val_loader is not None and ood_val_mse < best_ood_val_mse:
+                # OOD improved but same-day didn't — still reset patience
+                best_ood_val_mse = ood_val_mse
+                patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= cfg.patience:
                     print(f"  Early stopping at epoch {epoch}")
                     break
+
+            # --- Fix 3+4: Snapshot saving after validation, with quality gate ---
+            # Fix 3: Account for warmup offset — cosine cycle starts after warmup
+            adjusted_epoch = epoch - cfg.warmup_epochs
+            if (cfg.scheduler_type == "cosine"
+                    and adjusted_epoch > 0
+                    and adjusted_epoch % cfg.snapshot_cycle_len == 0
+                    and snapshots_saved < cfg.num_snapshots
+                    and epoch != last_snapshot_epoch):
+                # Fix 4: Only save if val MSE is within 1.5x of best (quality gate)
+                current_snap_mse = min(ema_val_mse, val_mse_raw) if (
+                    ema is not None and epoch >= cfg.ema_start_epoch) else val_mse_raw
+                if best_val_mse == float("inf") or current_snap_mse <= best_val_mse * 1.5:
+                    snapshots_saved += 1
+                    snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
+                    if ema is not None and epoch >= cfg.ema_start_epoch:
+                        torch.save(_clean_state_dict(ema.state_dict()), snap_path)
+                    else:
+                        torch.save(_clean_state_dict(model.state_dict()), snap_path)
+                    last_snapshot_epoch = epoch
+                    print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved at epoch {epoch} "
+                          f"(MSE: {current_snap_mse:.6f})")
+                else:
+                    print(f"  -> Snapshot skipped at epoch {epoch} "
+                          f"(MSE {current_snap_mse:.6f} > 1.5x best {best_val_mse:.6f})")
 
     # If we didn't collect enough snapshots, save remaining from current state
     if cfg.scheduler_type == "cosine":
