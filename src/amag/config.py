@@ -172,12 +172,12 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4.2: d=64, no DANN, stronger regularization.
+    """Competition config v4.3: reduced augmentation, longer training, multi-norm inference.
 
-    v4.2: DANN disabled — gradient reversal destroyed Beignet same-day signal
-    (108K vs 48K target). Cross-date gain from DANN (~2-5K) not worth the
-    ~60K same-day regression. Restore v3.5 snapshot_cycle_len=65 and
-    weight_decay=1e-4. Multi-seed ensemble (3 seeds x 5 models = 15 per monkey).
+    v4.3: Reduce augmentation for better same-day fit (jitter 0.01, scale 0.05,
+    channel_drop 0.05, mixup 0.15). Longer training (300 epochs, patience=40)
+    with 4 snapshot cycles of 70 epochs. Multi-normalization weighted prediction
+    in submission/model.py eliminates session matching failures.
     """
     return TrainConfig(
         # Model: paper-faithful d=64 (prevents overfitting on 630-1049 samples)
@@ -192,27 +192,27 @@ def phase2_config() -> TrainConfig:
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
         weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 65 epochs)
+        # Scheduler: CosineAnnealingWarmRestarts (4 cycles of 70 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=200,
+        epochs=300,
         val_every=5,
-        patience=25,
+        patience=40,
         warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=15,
-        # Snapshot ensemble — 3 snapshots from 65-epoch cycles
-        num_snapshots=3,
-        snapshot_cycle_len=65,
-        # Augmentation
-        aug_jitter_std=0.02,
-        aug_scale_std=0.1,
-        aug_channel_drop_p=0.1,
-        # Mixup (Zhang et al., ICLR 2018)
+        # Snapshot ensemble — 4 snapshots from 70-epoch cycles
+        num_snapshots=4,
+        snapshot_cycle_len=70,
+        # Augmentation — reduced for better same-day precision
+        aug_jitter_std=0.01,
+        aug_scale_std=0.05,
+        aug_channel_drop_p=0.05,
+        # Mixup (Zhang et al., ICLR 2018) — reduced alpha
         use_mixup=True,
-        mixup_alpha=0.2,
+        mixup_alpha=0.15,
         # No instance normalization — Dish-TS CONET overfit, RevIN unstable
         use_revin=False,
         use_dish_ts=False,

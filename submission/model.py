@@ -656,8 +656,45 @@ class Model:
         context_len = 10
         n, t, c, f = x.shape
 
-        # Find best matching normalization stats
-        mean, std = self._find_best_session_stats(x)
+        if self.norm_stats is None or len(self.norm_stats) == 1:
+            # Single session or TTA fallback — use original approach
+            mean, std = self._find_best_session_stats(x)
+            return self._predict_with_stats(x, mean, std)
+
+        # Compute context-only test stats for matching (avoid masked future bias)
+        context = x[:, :context_len]
+        ctx_flat = context.reshape(n * context_len, c * f)
+        data_mean = ctx_flat.mean(axis=0)
+        data_std = ctx_flat.std(axis=0)
+
+        # Score each session
+        scores = []
+        for i, (s_mean, s_std) in enumerate(self.norm_stats):
+            mean_corr = np.corrcoef(data_mean, s_mean.flatten())[0, 1]
+            std_corr = np.corrcoef(data_std, s_std.flatten())[0, 1]
+            score = 0.5 * mean_corr + 0.5 * std_corr
+            scores.append(score)
+
+        # Softmax with temperature=0.02 (very sharp — near-argmax but smooth)
+        scores = np.array(scores)
+        exp_scores = np.exp((scores - scores.max()) / 0.02)
+        weights = exp_scores / exp_scores.sum()
+        print(f"  Session scores: {scores}, weights: {weights}")
+
+        # Predict with each normalization, blend
+        final_pred = np.zeros((n, t, c), dtype=np.float64)
+        for i, (mean, std) in enumerate(self.norm_stats):
+            if weights[i] < 0.001:
+                continue
+            pred_raw = self._predict_with_stats(x, mean, std)
+            final_pred += weights[i] * pred_raw
+
+        return final_pred.astype(np.float32)
+
+    def _predict_with_stats(self, x, mean, std):
+        """Run full ensemble prediction with given normalization stats."""
+        context_len = 10
+        n, t, c, f = x.shape
 
         # Normalize using training stats (same pipeline as training)
         x_norm = normalize_data(x, mean, std)
@@ -692,6 +729,4 @@ class Model:
         pred_norm_all = weighted_sum.astype(np.float32)
 
         # Denormalize with same stats used for normalization
-        pred_raw = denormalize_lmp(pred_norm_all, mean, std, f)
-
-        return pred_raw
+        return denormalize_lmp(pred_norm_all, mean, std, f)
