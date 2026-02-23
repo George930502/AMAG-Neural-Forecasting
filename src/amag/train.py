@@ -126,6 +126,20 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     np.savez(str(norm_stats_path), **stats_dict)
     print(f"Saved normalization stats to {norm_stats_path}")
 
+    # Channel weights: weight loss by std_lmp² to match raw-space evaluation
+    channel_weights_t = None
+    if cfg.use_channel_weights:
+        all_std_lmp_sq = []
+        for (m, s) in per_session_stats:
+            std_lmp = s[0, ::cfg.num_features]  # (C,) — LMP std per channel
+            all_std_lmp_sq.append((4.0 * std_lmp) ** 2)
+        mean_weights = np.mean(all_std_lmp_sq, axis=0)  # Average across sessions
+        mean_weights = mean_weights / mean_weights.mean()  # Normalize to mean=1
+        channel_weights_t = torch.from_numpy(mean_weights).float().to(device)
+        print(f"Channel weights: min={channel_weights_t.min():.4f}, "
+              f"max={channel_weights_t.max():.4f}, "
+              f"ratio={channel_weights_t.max()/channel_weights_t.min():.1f}x")
+
     # Gradient accumulation: effective_batch = batch_size * accumulate_steps
     accumulate_steps = cfg.accumulate_steps
 
@@ -317,7 +331,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             forecast_pred = pred[:, cfg.context_len:]
             forecast_target = target_norm[:, cfg.context_len:]
 
-            mse_loss = criterion(forecast_pred, forecast_target)
+            if channel_weights_t is not None:
+                se = (forecast_pred - forecast_target) ** 2  # (B, T, C)
+                mse_loss = (se * channel_weights_t).mean()
+            else:
+                mse_loss = criterion(forecast_pred, forecast_target)
 
             # Spectral loss
             spec_l = torch.tensor(0.0, device=device)

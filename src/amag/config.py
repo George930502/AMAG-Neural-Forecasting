@@ -121,6 +121,9 @@ class TrainConfig:
     # Loss type: "mse" or "huber"
     loss_type: str = "mse"
 
+    # Channel-weighted loss: weight channels by std_lmp² to match raw-space eval
+    use_channel_weights: bool = False
+
     # Session embeddings
     use_session_embed: bool = False
     num_sessions: int = 3
@@ -172,8 +175,10 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4.3: reduced augmentation, longer training, multi-norm inference.
+    """Competition config v4.4: channel-weighted loss to match raw-space evaluation.
 
+    v4.4: Weight training loss by channel std_lmp² so high-variance channels
+    (which dominate raw-space Codabench MSE) get proportionally more gradient.
     v4.3: Reduce augmentation for better same-day fit (jitter 0.01, scale 0.05,
     channel_drop 0.05, mixup 0.15). Longer training (300 epochs, patience=40)
     with 4 snapshot cycles of 70 epochs. Multi-normalization weighted prediction
@@ -226,8 +231,9 @@ def phase2_config() -> TrainConfig:
         mmd_lambda=0.0,
         # Spectral loss disabled
         spectral_lambda=0.0,
-        # MSE loss
+        # MSE loss with channel weighting to match raw-space evaluation
         loss_type="mse",
+        use_channel_weights=True,
         # Session embeddings disabled
         use_session_embed=False,
         num_sessions=3,
