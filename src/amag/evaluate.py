@@ -122,15 +122,17 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
     has_seed_dirs = any(d.is_dir() for d in ckpt_dir.glob("seed_*"))
 
     if has_seed_dirs:
-        # Remove stale top-level checkpoints from submission/ to prevent
-        # config detection from loading old (wrong architecture) models
+        # Remove stale top-level checkpoints for THIS monkey only
         for pattern in patterns:
             for stale in sub_dir.glob(pattern):
                 stale.unlink()
-        # Also remove stale seed dirs from submission/
+        # Remove stale files for THIS monkey within existing seed dirs
+        # (don't rmtree — other monkey's files may be there)
         for stale_seed in sub_dir.glob("seed_*"):
             if stale_seed.is_dir():
-                shutil.rmtree(str(stale_seed))
+                for pattern in patterns:
+                    for stale in stale_seed.glob(pattern):
+                        stale.unlink()
 
     # Top-level checkpoints (only if no seed dirs — legacy single-seed mode)
     if not has_seed_dirs:
