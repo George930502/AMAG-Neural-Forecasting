@@ -135,6 +135,15 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
             all_std_lmp_sq.append((4.0 * std_lmp) ** 2)
         mean_weights = np.mean(all_std_lmp_sq, axis=0)  # Average across sessions
         mean_weights = mean_weights / mean_weights.mean()  # Normalize to mean=1
+        # Clamp to prevent extreme ratios (Beignet has 156x unclamped)
+        if cfg.channel_weight_max_ratio > 0:
+            ratio_before = mean_weights.max() / mean_weights.min()
+            w_min = mean_weights.max() / cfg.channel_weight_max_ratio
+            mean_weights = np.maximum(mean_weights, w_min)
+            mean_weights = mean_weights / mean_weights.mean()  # Re-normalize to mean=1
+            ratio_after = mean_weights.max() / mean_weights.min()
+            print(f"Channel weight ratio: {ratio_before:.1f}x -> {ratio_after:.1f}x "
+                  f"(clamped to {cfg.channel_weight_max_ratio}x)")
         channel_weights_t = torch.from_numpy(mean_weights).float().to(device)
         print(f"Channel weights: min={channel_weights_t.min():.4f}, "
               f"max={channel_weights_t.max():.4f}, "

@@ -123,6 +123,7 @@ class TrainConfig:
 
     # Channel-weighted loss: weight channels by std_lmp² to match raw-space eval
     use_channel_weights: bool = False
+    channel_weight_max_ratio: float = 10.0  # Max ratio between highest/lowest channel weight
 
     # Session embeddings
     use_session_embed: bool = False
@@ -175,13 +176,14 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4.4: channel-weighted loss to match raw-space evaluation.
+    """Competition config v4.5: clamp channel weight ratio + longer training.
 
+    v4.5: Clamp channel weight ratio to 10x (Beignet was 156.7x unclamped).
+    Longer training (400 epochs, patience=50) with 5 snapshot cycles of 80 epochs.
     v4.4: Weight training loss by channel std_lmp² so high-variance channels
     (which dominate raw-space Codabench MSE) get proportionally more gradient.
     v4.3: Reduce augmentation for better same-day fit (jitter 0.01, scale 0.05,
-    channel_drop 0.05, mixup 0.15). Longer training (300 epochs, patience=40)
-    with 4 snapshot cycles of 70 epochs. Multi-normalization weighted prediction
+    channel_drop 0.05, mixup 0.15). Multi-normalization weighted prediction
     in submission/model.py eliminates session matching failures.
     """
     return TrainConfig(
@@ -197,20 +199,20 @@ def phase2_config() -> TrainConfig:
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
         weight_decay=1e-4,
-        # Scheduler: CosineAnnealingWarmRestarts (4 cycles of 70 epochs)
+        # Scheduler: CosineAnnealingWarmRestarts (5 cycles of 80 epochs)
         scheduler_type="cosine",
         lr=5e-4,
-        epochs=300,
+        epochs=400,
         val_every=5,
-        patience=40,
+        patience=50,
         warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=15,
-        # Snapshot ensemble — 4 snapshots from 70-epoch cycles
-        num_snapshots=4,
-        snapshot_cycle_len=70,
+        # Snapshot ensemble — 5 snapshots from 80-epoch cycles
+        num_snapshots=5,
+        snapshot_cycle_len=80,
         # Augmentation — reduced for better same-day precision
         aug_jitter_std=0.01,
         aug_scale_std=0.05,
