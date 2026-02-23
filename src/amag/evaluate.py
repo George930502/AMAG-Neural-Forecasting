@@ -117,7 +117,8 @@ def _link_checkpoints(ckpt_dir: Path, sub_dir: Path, monkey_name: str):
     patterns = [f"amag_{monkey_name}_snap*.pth",
                 f"amag_{monkey_name}_best.pth",
                 f"amag_{monkey_name}_ema_best.pth",
-                f"norm_stats_{monkey_name}.npz"]
+                f"norm_stats_{monkey_name}.npz",
+                f"meta_{monkey_name}.json"]
 
     has_seed_dirs = any(d.is_dir() for d in ckpt_dir.glob("seed_*"))
 

@@ -9,6 +9,7 @@ Expected files alongside this script:
   - norm_stats_{monkey}.npz (training normalization stats)
 """
 
+import json
 import os
 import math
 import numpy as np
@@ -702,13 +703,27 @@ class Model:
         # Mask future (same as training)
         x_norm[:, context_len:] = x_norm[:, context_len - 1: context_len]
 
-        # Weighted ensemble: best/ema_best get 2x weight vs snapshots
+        # Quality-weighted ensemble: use 1/MSE from training metadata
         weights = []
         for p in self._all_paths:
             bname = os.path.basename(p)
+            seed_dir = os.path.dirname(p)
+            meta_path = os.path.join(seed_dir, f"meta_{self.monkey_name}.json")
+
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                mse = meta.get(bname, None)
+                if mse is not None and mse > 0:
+                    weights.append(1.0 / mse)
+                    continue
+
+            # Fallback: old scheme for checkpoints without metadata
             weights.append(2.0 if "best" in bname else 1.0)
+
         total_w = sum(weights)
         weights = [w / total_w for w in weights]
+        print(f"  Ensemble weights: {[f'{w:.3f}' for w in weights]}")
 
         # Single clean forward pass per model (no TTA — hurts overfit models)
         batch_size = 8 if self.num_channels > 200 else 16

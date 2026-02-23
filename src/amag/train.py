@@ -1,4 +1,5 @@
 import copy
+import json
 import torch
 import torch.nn as nn
 import numpy as np
@@ -248,6 +249,9 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
     best_ema_val_mse = float("inf")
     patience_counter = 0
 
+    # Per-checkpoint val MSE metadata for quality-weighted ensemble
+    checkpoint_mses = {}
+
     # Snapshot tracking — with validation MSE for quality-gated saving
     snapshots_saved = 0
     last_snapshot_epoch = -1
@@ -427,6 +431,7 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     best_ema_val_mse = ema_val_mse
                     save_path = ckpt_dir / f"amag_{monkey_name}_ema_best.pth"
                     torch.save(_clean_state_dict(ema.state_dict()), save_path)
+                    checkpoint_mses[f"amag_{monkey_name}_ema_best.pth"] = ema_val_mse
 
             lr = optimizer.param_groups[0]["lr"]
             aux_str = ""
@@ -454,9 +459,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                 save_path = ckpt_dir / f"amag_{monkey_name}_best.pth"
                 if ema is not None and epoch >= cfg.ema_start_epoch and ema_val_mse <= val_mse_raw:
                     torch.save(_clean_state_dict(ema.state_dict()), save_path)
+                    checkpoint_mses[f"amag_{monkey_name}_best.pth"] = ema_val_mse
                     print(f"  -> New best (EMA)! Saved to {save_path}")
                 else:
                     torch.save(_clean_state_dict(model.state_dict()), save_path)
+                    checkpoint_mses[f"amag_{monkey_name}_best.pth"] = val_mse_raw
                     print(f"  -> New best! Saved to {save_path}")
             else:
                 patience_counter += 1
@@ -481,9 +488,11 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     # v3.5: Save whichever model is actually better, not always EMA
                     if ema is not None and epoch >= cfg.ema_start_epoch and ema_val_mse <= val_mse_raw:
                         torch.save(_clean_state_dict(ema.state_dict()), snap_path)
+                        checkpoint_mses[f"amag_{monkey_name}_snap{snapshots_saved}.pth"] = ema_val_mse
                         snap_mse_label = f"EMA MSE: {ema_val_mse:.6f}"
                     else:
                         torch.save(_clean_state_dict(model.state_dict()), snap_path)
+                        checkpoint_mses[f"amag_{monkey_name}_snap{snapshots_saved}.pth"] = val_mse_raw
                         snap_mse_label = f"Model MSE: {val_mse_raw:.6f}"
                     last_snapshot_epoch = epoch
                     print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved at epoch {epoch} "
@@ -492,16 +501,31 @@ def train_monkey(monkey_name: str, cfg: TrainConfig):
                     print(f"  -> Snapshot skipped at epoch {epoch} "
                           f"(MSE {current_snap_mse:.6f} > 1.5x best {best_val_mse:.6f})")
 
-    # If we didn't collect enough snapshots, save remaining from current state
+    # If we didn't collect enough snapshots, save remaining ONLY if quality is acceptable
     if cfg.scheduler_type == "cosine":
         while snapshots_saved < cfg.num_snapshots:
+            # Quality gate: don't save if current model is much worse than best
+            final_mse = min(ema_val_mse, val_mse_raw) if (
+                ema is not None) else val_mse_raw
+            if best_val_mse != float("inf") and final_mse > best_val_mse * 1.5:
+                print(f"  -> Remaining {cfg.num_snapshots - snapshots_saved} snapshots skipped "
+                      f"(MSE {final_mse:.0f} > 1.5x best {best_val_mse:.0f})")
+                break
             snapshots_saved += 1
             snap_path = ckpt_dir / f"amag_{monkey_name}_snap{snapshots_saved}.pth"
             if ema is not None:
                 torch.save(_clean_state_dict(ema.state_dict()), snap_path)
+                checkpoint_mses[f"amag_{monkey_name}_snap{snapshots_saved}.pth"] = ema_val_mse
             else:
                 torch.save(_clean_state_dict(model.state_dict()), snap_path)
+                checkpoint_mses[f"amag_{monkey_name}_snap{snapshots_saved}.pth"] = val_mse_raw
             print(f"  -> Snapshot {snapshots_saved}/{cfg.num_snapshots} saved (final)")
+
+    # Save per-checkpoint metadata for quality-weighted ensemble
+    meta_path = ckpt_dir / f"meta_{monkey_name}.json"
+    with open(meta_path, "w") as f:
+        json.dump(checkpoint_mses, f, indent=2)
+    print(f"Saved checkpoint metadata to {meta_path} ({len(checkpoint_mses)} entries)")
 
     print(f"\nTraining complete. Best val MSE (raw): {best_val_mse:.6f}")
     if ema is not None:
