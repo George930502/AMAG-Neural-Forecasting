@@ -172,12 +172,12 @@ def phase1_config() -> TrainConfig:
 
 
 def phase2_config() -> TrainConfig:
-    """Competition config v4.1: d=64 + DANN (no Dish-TS).
+    """Competition config v4.2: d=64, no DANN, stronger regularization.
 
-    v4.1: Dish-TS disabled — CONET overfit to training distribution causing
-    Beignet same-day test MSE to explode (148K vs 48K target). Plain training
-    norm stats generalize better. Keep DANN for strong cross-date scores.
-    Multi-seed ensemble (3 seeds x 5 models = 15 models per monkey).
+    v4.2: DANN disabled — gradient reversal destroyed Beignet same-day signal
+    (108K vs 48K target). Cross-date gain from DANN (~2-5K) not worth the
+    ~60K same-day regression. Restore v3.5 snapshot_cycle_len=65 and
+    weight_decay=1e-4. Multi-seed ensemble (3 seeds x 5 models = 15 per monkey).
     """
     return TrainConfig(
         # Model: paper-faithful d=64 (prevents overfitting on 630-1049 samples)
@@ -191,21 +191,21 @@ def phase2_config() -> TrainConfig:
         use_feature_pathways=False,
         # Optimizer: AdamW (Loshchilov & Hutter, ICLR 2019)
         optimizer_type="adamw",
-        weight_decay=5e-5,
-        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 60 epochs)
+        weight_decay=1e-4,
+        # Scheduler: CosineAnnealingWarmRestarts (3 cycles of 65 epochs)
         scheduler_type="cosine",
         lr=5e-4,
         epochs=200,
         val_every=5,
-        patience=30,
+        patience=25,
         warmup_epochs=5,
         # EMA (Polyak & Juditsky, 1992)
         use_ema=True,
         ema_decay=0.999,
         ema_start_epoch=15,
-        # Snapshot ensemble — 3 snapshots from 60-epoch cycles
+        # Snapshot ensemble — 3 snapshots from 65-epoch cycles
         num_snapshots=3,
-        snapshot_cycle_len=60,
+        snapshot_cycle_len=65,
         # Augmentation
         aug_jitter_std=0.02,
         aug_scale_std=0.1,
@@ -216,10 +216,10 @@ def phase2_config() -> TrainConfig:
         # No instance normalization — Dish-TS CONET overfit, RevIN unstable
         use_revin=False,
         use_dish_ts=False,
-        # DANN (Ganin et al., JMLR 2016) — domain-adversarial training
-        use_dann=True,
-        dann_lambda=0.1,
-        # CORAL/consistency/MMD disabled — replaced by DANN
+        # DANN disabled — destroys same-day signal for marginal cross-date gain
+        use_dann=False,
+        dann_lambda=0.0,
+        # CORAL/consistency/MMD disabled
         coral_lambda=0.0,
         use_consistency=False,
         consist_lambda=0.0,

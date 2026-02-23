@@ -611,8 +611,7 @@ class Model:
     def _find_best_session_stats(self, x):
         """Find the best matching session stats for this data.
 
-        Computes correlation between data's global stats and each session's
-        training stats. Returns the best matching session's stats.
+        Uses combined mean + std correlation for robust session matching.
         If norm_stats not available, falls back to context-window TTA.
         """
         if self.norm_stats is None:
@@ -627,19 +626,24 @@ class Model:
         if len(self.norm_stats) == 1:
             return self.norm_stats[0]
 
-        # Compute data stats for matching
+        # Compute test data stats
         n, t, c, f_dim = x.shape
         flat = x.reshape(n * t, c * f_dim)
-        data_mean = flat.mean(axis=0, keepdims=True)
+        data_mean = flat.mean(axis=0)
+        data_std = flat.std(axis=0)
 
-        # Find closest session by mean correlation
-        best_corr = -1
+        # Combined matching: mean correlation + std correlation
+        best_score = -2
         best_idx = 0
         for i, (s_mean, s_std) in enumerate(self.norm_stats):
-            corr = np.corrcoef(data_mean.flatten(), s_mean.flatten())[0, 1]
-            if corr > best_corr:
-                best_corr = corr
+            mean_corr = np.corrcoef(data_mean, s_mean.flatten())[0, 1]
+            std_corr = np.corrcoef(data_std, s_std.flatten())[0, 1]
+            score = 0.5 * mean_corr + 0.5 * std_corr
+            if score > best_score:
+                best_score = score
                 best_idx = i
+
+        print(f"  Matched to session {best_idx} (score={best_score:.4f})")
         return self.norm_stats[best_idx]
 
     def predict(self, x):
