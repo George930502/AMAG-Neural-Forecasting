@@ -1,6 +1,6 @@
 # Neural Forecasting — NSF HDR Hackathon 2025
 
-This repository contains training code and submissions for the [2025 HDR Scientific Mood (Modeling out of distribution) Challenge: Neural Forecasting](https://www.codabench.org/competitions/9806/) from team 20iterations.
+This repository contains training code and submission files for the [2025 HDR Scientific Mood (Modeling out of distribution) Challenge: Neural Forecasting](https://www.codabench.org/competitions/9806/) from team 20iterations.
 
 ## Repository Structure
 
@@ -152,8 +152,8 @@ Pre-trained weights are included in `submission/checkpoints/`.
 
 ## References
 
-- Li et al., ["AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity"](https://arxiv.org/abs/2310.02927), NeurIPS 2023
-- Kim et al., ["Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"](https://arxiv.org/abs/2105.02855), ICLR 2022
+- Li et al., ["AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity"](https://proceedings.neurips.cc/paper_files/paper/2023/hash/1c70ba3591d0694a535089e1c25888d7-Abstract-Conference.html), NeurIPS 2023
+- Kim et al., ["Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"](https://openreview.net/forum?id=cGDAkQo1C0p), ICLR 2022
 - Liu et al., ["iTransformer: Inverted Transformers Are Effective for Time Series Forecasting"](https://arxiv.org/abs/2310.06625), ICLR 2024
 - Zhang et al., ["mixup: Beyond Empirical Risk Minimization"](https://arxiv.org/abs/1710.09412), ICLR 2018
 - Huang et al., ["Snapshot Ensembles: Train 1, Get M for Free"](https://arxiv.org/abs/1704.00109), ICLR 2017
