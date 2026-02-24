@@ -1,13 +1,17 @@
 # Python
 __pycache__/
 *.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
 .venv/
+venv/
 
-# Data & checkpoints (too large for git)
+# Data (too large for git)
 dataset/
 checkpoints/
-*.pth
-submission.zip
 
 # IDE
 .vscode/
@@ -20,11 +24,16 @@ Thumbs.db
 # Paper PDF
 *.pdf
 
-# Challenge bundle (reference only)
+# Challenge bundles
 HDRChallenge_y2/
+HDR-SMood-Challenge-sample/
+NSF_HDR_*.zip
+submission.zip
+_extract_tmp/
 
-# uv lock (reproducible via uv sync)
+# uv
 uv.lock
 
-# Claude session logs
+# Claude
 .claude/
+CLAUDE.md
