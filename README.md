@@ -1,9 +1,6 @@
-# AMAG Neural Forecasting — NSF HDR Hackathon 2025
+# Neural Forecasting — NSF HDR Hackathon 2025
 
-Forecasting neural activity from micro-electrocorticography (µECoG) recordings using **AMAG** (Additive, Multiplicative and Adaptive Graph Neural Network) with multi-head transformers, channel attention, and cross-session domain adaptation.
-
-**Competition:** [NSF HDR Scientific Modeling Out of Distribution: Neural Forecasting](https://www.codabench.org/competitions/9854/)
-**Paper:** Li et al., "AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity", [NeurIPS 2023](https://github.com/shlizee/AMAG)
+This repository contains training code and submissions for the [2025 HDR Scientific Mood (Modeling out of distribution) Challenge: Neural Forecasting](https://www.codabench.org/competitions/9806/) from team 20iterations.
 
 ## Repository Structure
 
@@ -88,7 +85,25 @@ Each `.npz` file contains data shaped `(N, 20, C, 9)`:
 - **C** = channels (89 for beignet, 239 for affi)
 - **9** = features (LMP + 8 frequency bands)
 
-Training data should be placed in `dataset/train/` and test data in `dataset/test/`.
+To reproduce training, place the dataset files under `dataset/` relative to the repo root (the training script reads from `dataset/train/` by default):
+
+```
+dataset/
+├── train/
+│   ├── train_data_affi.npz
+│   ├── train_data_affi_2024-03-20_private.npz
+│   ├── train_data_beignet.npz
+│   ├── train_data_beignet_2022-06-01_private.npz
+│   └── train_data_beignet_2022-06-02_private.npz
+└── test/
+    ├── test_data_affi_masked.npz
+    ├── test_data_affi_2024-03-20_private_masked.npz
+    ├── test_data_beignet_masked.npz
+    ├── test_data_beignet_2022-06-01_private_masked.npz
+    └── test_data_beignet_2022-06-02_private_masked.npz
+```
+
+The dataset is provided by the challenge organizers and is not included in this repository.
 
 ## Installation
 
@@ -114,9 +129,6 @@ cd training
 python run_train.py beignet
 python run_train.py affi
 
-# Paper-faithful reproduction (single seed)
-python run_train.py beignet --phase paper
-
 # Custom seeds or epochs
 python run_train.py beignet --seeds 42 123 456 --epochs 400
 ```
@@ -140,8 +152,8 @@ Pre-trained weights are included in `submission/checkpoints/`.
 
 ## References
 
-- Li et al., "AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity", NeurIPS 2023
-- Kim et al., "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift", ICLR 2022
-- Liu et al., "iTransformer: Inverted Transformers Are Effective for Time Series Forecasting", ICLR 2024
-- Zhang et al., "mixup: Beyond Empirical Risk Minimization", ICLR 2018
-- Huang et al., "Snapshot Ensembles: Train 1, Get M for Free", ICLR 2017
+- Li et al., ["AMAG: Additive, Multiplicative and Adaptive Graph Neural Network For Forecasting Neural Activity"](https://arxiv.org/abs/2310.02927), NeurIPS 2023
+- Kim et al., ["Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift"](https://arxiv.org/abs/2105.02855), ICLR 2022
+- Liu et al., ["iTransformer: Inverted Transformers Are Effective for Time Series Forecasting"](https://arxiv.org/abs/2310.06625), ICLR 2024
+- Zhang et al., ["mixup: Beyond Empirical Risk Minimization"](https://arxiv.org/abs/1710.09412), ICLR 2018
+- Huang et al., ["Snapshot Ensembles: Train 1, Get M for Free"](https://arxiv.org/abs/1704.00109), ICLR 2017
